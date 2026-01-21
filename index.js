@@ -580,7 +580,7 @@ INNER JOIN det_evento_division dedf
 INNER JOIN divisiones df
   ON df.coddivision = dedf.coddivision
 
-WHERE e.estado = 'A'
+WHERE e.estado <> 'B'
   AND df.codclub = :codclub
   ${tieneDivisiones ? "AND dedf.coddivision IN (:coddivisiones)" : ""}
   ${fecha_desde && fecha_hasta ? "AND e.fecha BETWEEN :fecha_desde AND :fecha_hasta" : ""}
@@ -610,7 +610,64 @@ ORDER BY e.fecha DESC
 });
 
 
+// Endpoint para cambiar el estado de un evento
+app.post("/evento_estado", verificarToken, async (req, res) => {
+  const { codevento, tipo } = req.body;
 
+  // Validar que se reciban los parámetros necesarios
+  if (!codevento || !tipo) {
+    return res.status(400).json({ 
+      error: "Se requieren codevento y tipo" 
+    });
+  }
+
+  // Validar que el tipo sea un estado válido
+  const estadosValidos = ['A', 'I', 'F', 'C']; // Activo, Inactivo, Finalizado, Cancelado
+  if (!estadosValidos.includes(tipo)) {
+    return res.status(400).json({ 
+      error: "Tipo de estado no válido. Debe ser: A, I, F o C" 
+    });
+  }
+
+  try {
+    // Ejecutar el update
+    const [updatedRows] = await sequelize.query(
+      `UPDATE eventos SET estado = :tipo WHERE codevento = :codevento`,
+      {
+        replacements: { codevento, tipo },
+        type: sequelize.QueryTypes.UPDATE
+      }
+    );
+
+    if (updatedRows === 0) {
+      return res.status(404).json({ 
+        error: "Evento no encontrado" 
+      });
+    }
+
+    // Opcional: Devolver el evento actualizado
+    const [eventoActualizado] = await sequelize.query(
+      `SELECT * FROM eventos WHERE codevento = :codevento`,
+      {
+        replacements: { codevento },
+        type: sequelize.QueryTypes.SELECT
+      }
+    );
+
+    res.json({ 
+      success: true, 
+      message: `Estado del evento ${codevento} actualizado a ${tipo}`,
+      evento: eventoActualizado[0]
+    });
+
+  } catch (err) {
+    console.error("Error actualizando estado del evento:", err);
+    res.status(500).json({ 
+      error: "Error actualizando estado del evento",
+      detalle: err.message 
+    });
+  }
+});
 
 // ===================================================
 // =========== MIDDLEWARE TOKEN ======================
