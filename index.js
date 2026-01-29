@@ -300,6 +300,11 @@ app.post('/asistencias_divisiones', async (req, res) => {
     return res.status(400).json({ mensaje: 'Faltan fechas' });
   }
 
+  if (!Array.isArray(coddivisiones) || coddivisiones.length === 0) {
+
+    return res.status(400).json({ mensaje: 'Faltan divisiones' });
+  }
+
   try {
     // Construimos la condición de divisiones solo si hay datos
     let whereDivision = '';
@@ -345,7 +350,7 @@ app.post('/asistencias_divisiones', async (req, res) => {
     WHERE e.fecha BETWEEN :fecha_desde AND :fecha_hasta
         ${whereDivision}
         AND r.descripcion = 'Jugador' 
-        AND e.estado <> 'B'
+        AND e.estado = 'F' and p.estado <> 6
 )
 SELECT 
     codevento,
@@ -569,7 +574,7 @@ SELECT
       INNER JOIN det_evento_division ded2
         ON ded2.codevento = e.codevento
        AND ded2.coddivision = pd.coddivision
-      WHERE de.codevento = e.codevento
+      WHERE de.codevento = e.codevento and p.estado <> '6'
       ORDER BY d.descripcion, p.nombre
     ) x
   ) AS personas
@@ -666,6 +671,45 @@ app.post("/evento_estado", verificarToken, async (req, res) => {
       error: "Error actualizando estado del evento",
       detalle: err.message 
     });
+  }
+});
+
+
+
+
+
+//===========ACTIVIDADES==========================================
+app.post('/actividades_club', verificarToken, async (req, res) => {
+  const { codclub } = req.body;
+
+  if (!codclub)
+    return res.status(400).json({ mensaje: 'Falta codclub' });
+
+  try {
+    const rows = await sequelize.query(
+      `
+      SELECT 
+        a.codactividad,
+        a.descripcion
+      FROM actividades a
+      INNER JOIN actividades_clubes ac 
+        ON ac.codactividad = a.codactividad
+      WHERE ac.codclub = :codclub
+        AND ac.estado = '1'
+        AND a.estado = '1'
+      ORDER BY a.descripcion;
+
+      `,
+      {
+        replacements: { codclub },
+        type: sequelize.QueryTypes.SELECT
+      }
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error interno' });
   }
 });
 
