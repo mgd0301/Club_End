@@ -57,7 +57,7 @@ app.post('/login', async (req, res) => {
       const token = jwt.sign(
         { id: usuario.codpersona, email: usuario.email, usuario: usuario.usuario },
         process.env.JWT_SECRET || 'secreto123',
-        { expiresIn: '1h' }
+        { expiresIn: '18h' }
       );
 
       return res.json({ mensaje: 'Login normal OK', token, usuario });
@@ -210,6 +210,272 @@ app.post('/divisiones_disciplina', verificarToken, async (req, res) => {
 // { coddivision: [14, 13] }
 // o { coddivision: [14] }
 
+// ===================================================
+// REGISTRAR O ELIMINAR ASISTENCIA A ACTIVIDAD
+// ===================================================
+app.post('/actividad_asistencia', verificarToken, async (req, res) => {
+  const { codasistencia, codclub, codactividad, codpersona, fecha, observacion, estado } = req.body;
+
+  try {
+    // CASO 1: VIENE codasistencia Y ES MAYOR A 0 → HACER UPDATE (BAJA LÓGICA)
+    if (codasistencia && parseInt(codasistencia) > 0) {
+      
+      // Validar que el registro exista
+      const [existente] = await sequelize.query(
+        `SELECT codasistencia FROM actividades_asistencia 
+         WHERE codasistencia = :codasistencia`,
+        {
+          replacements: { codasistencia },
+          type: sequelize.QueryTypes.SELECT
+        }
+      );
+
+      if (!existente) {
+        return res.status(404).json({ mensaje: 'El registro de asistencia no existe' });
+      }
+
+      // Actualizar estado (baja lógica)
+      await sequelize.query(
+        `UPDATE actividades_asistencia 
+         SET estado = :estado
+         WHERE codasistencia = :codasistencia`,
+        {
+          replacements: { 
+            estado: estado || 'B',
+            codasistencia 
+          },
+          type: sequelize.QueryTypes.UPDATE
+        }
+      );
+
+      return res.json({ 
+        mensaje: 'Asistencia actualizada (baja lógica) correctamente',
+        codasistencia: codasistencia,
+        accion: 'UPDATE'
+      });
+    }
+
+    // CASO 2: NO VIENE codasistencia O VIENE 0 → HACER INSERT
+    else {
+      // Validar campos requeridos para INSERT
+      if (!codclub) return res.status(400).json({ mensaje: 'Falta codclub' });
+      if (!codactividad) return res.status(400).json({ mensaje: 'Falta codactividad' });
+      if (!codpersona) return res.status(400).json({ mensaje: 'Falta codpersona' });
+      if (!fecha) return res.status(400).json({ mensaje: 'Falta fecha' });
+
+      // 🔥 CORRECCIÓN: Formatear fecha para MySQL
+      const fechaMySQL = new Date(fecha).toISOString().slice(0, 19).replace('T', ' ');
+      // '2026-02-17T18:01:17.000Z' → '2026-02-17 18:01:17'
+
+      console.log('📅 Fecha original:', fecha);
+      console.log('📅 Fecha formateada:', fechaMySQL);
+
+      // Insertar nuevo registro
+      const [result] = await sequelize.query(
+        `INSERT INTO actividades_asistencia 
+         (codactividad, codclub, codpersona, fecha, observacion, estado) 
+         VALUES 
+         (:codactividad, :codclub, :codpersona, :fecha, :observacion, 'A')`,
+        {
+          replacements: { 
+            codactividad, 
+            codclub, 
+            codpersona, 
+            fecha: fechaMySQL, // ← Usamos la fecha formateada
+            observacion: observacion || null 
+          },
+          type: sequelize.QueryTypes.INSERT
+        }
+      );
+
+      return res.json({ 
+        mensaje: 'Asistencia registrada correctamente',
+        codasistencia: result,
+        accion: 'INSERT'
+      });
+    }
+
+  } catch (error) {
+    console.error('Error en actividad_asistencia:', error);
+    res.status(500).json({ mensaje: 'Error interno del servidor' });
+  }
+});
+
+app.post('/personas_jugadores_actividades', verificarToken, async (req, res) => {
+  let { codclub, coddivision, coddisciplina, codactividad, filtro } = req.body;
+
+  console.log("filtro: ", filtro );
+
+  if (!codclub)
+    return res.status(400).json({ mensaje: 'Falta codclub' });
+
+  if (!coddisciplina)
+    return res.status(400).json({ mensaje: 'Falta coddisciplina' });
+
+  if (!codactividad)
+    return res.status(400).json({ mensaje: 'Falta codactividad' });
+
+  try {
+    let query = `
+      SELECT 
+        p.codpersona,
+        p.nombre,
+        p.apodo,
+        d.descripcion AS division,
+        r.descripcion AS rol,
+        -- Contar asistencias de la semana actual
+        (
+            SELECT COUNT(*) 
+            FROM actividades_asistencia aa 
+            WHERE aa.codpersona = p.codpersona 
+                AND aa.codactividad = :codactividad
+                AND aa.estado = 'A'
+                AND YEARWEEK(aa.fecha, 1) = YEARWEEK(CURDATE(), 1)
+        ) AS asistencias_semana,
+        -- Última fecha de asistencia (la más reciente)
+        (
+            SELECT MAX(aa.fecha)
+            FROM actividades_asistencia aa 
+            WHERE aa.codpersona = p.codpersona 
+                AND aa.codactividad = :codactividad
+                AND aa.estado = 'A'
+        ) AS fecha_ult_asistencia
+      FROM personas_divisiones pd
+      INNER JOIN personas p ON p.codpersona = pd.codpersona
+      INNER JOIN divisiones d ON d.coddivision = pd.coddivision
+      INNER JOIN roles r ON r.codrol = pd.codrol
+      WHERE p.estado <> 6
+          AND d.estado = 'A'
+          AND pd.codrol = 1  -- Solo jugadores
+          AND d.codclub = :codclub
+          AND d.coddisciplina = :coddisciplina
+    `;
+
+    const replacements = {
+      codclub,
+      coddisciplina,
+      codactividad  // ✅ AGREGADO: faltaba esto
+    };
+
+    // 🔹 Filtrar división solo si != 0
+    if (filtro && filtro.trim() !== ""){
+
+      console.log("Filtrando por nombre o apodo en todas las divisiones");
+
+    } else {
+        
+      if (coddivision && coddivision !== 0) {
+        if (!Array.isArray(coddivision))
+          coddivision = [coddivision];
+
+        query += ` AND pd.coddivision IN (:coddivision)`;
+        replacements.coddivision = coddivision;
+      }}
+
+    // 🔹 Filtro nombre/apodo
+    if (filtro && filtro.trim() !== "") {
+      query += `
+        AND (
+          LOWER(p.nombre) LIKE LOWER(:filtro)
+          OR LOWER(p.apodo) LIKE LOWER(:filtro)
+        )
+      `;
+      replacements.filtro = `%${filtro}%`;
+    }
+
+    query += ` ORDER BY p.apodo, p.nombre`;
+
+    const rows = await sequelize.query(query, {
+      replacements,
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    res.json(rows);
+
+  } catch (error) {
+    console.error('❌ Error en personas_jugadores_actividades:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+
+
+app.post('/asistencias_por_semana', verificarToken, async (req, res) => {
+  const { codpersona, codactividad, dias = 60 } = req.body;
+  
+  if (!codpersona) return res.status(400).json({ mensaje: 'Falta codpersona' });
+  if (!codactividad) return res.status(400).json({ mensaje: 'Falta codactividad' });
+
+  try {
+    const rows = await sequelize.query(`
+      SELECT 
+        YEARWEEK(aa.fecha, 1) as semana_id,
+        -- Usamos MIN/MAX para que MySQL no se queje
+        MIN(DATE_FORMAT(DATE_SUB(aa.fecha, INTERVAL WEEKDAY(aa.fecha) DAY), '%d/%m')) as semana_inicio,
+        MAX(DATE_FORMAT(DATE_ADD(aa.fecha, INTERVAL (6 - WEEKDAY(aa.fecha)) DAY), '%d/%m')) as semana_fin,
+        COUNT(*) as asistencias
+      FROM actividades_asistencia aa
+      WHERE aa.codpersona = :codpersona
+        AND aa.codactividad = :codactividad
+        AND aa.estado = 'A'
+        AND aa.fecha >= DATE_SUB(CURDATE(), INTERVAL :dias DAY)
+      GROUP BY YEARWEEK(aa.fecha, 1)
+      ORDER BY semana_id DESC
+      LIMIT 10
+    `, {
+      replacements: { codpersona, codactividad, dias },
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    res.json({
+      semanas: rows,
+      total_asistencias: rows.reduce((acc, s) => acc + s.asistencias, 0),
+      dias_consultados: dias
+    });
+
+  } catch (error) {
+    console.error('Error en asistencias_por_semana:', error);
+    res.status(500).json({ mensaje: 'Error interno del servidor' });
+  }
+});
+
+app.post('/historial_asistencias', verificarToken, async (req, res) => {
+  const { codpersona, codactividad, dias = 30 } = req.body;
+  
+  if (!codpersona) return res.status(400).json({ mensaje: 'Falta codpersona' });
+  if (!codactividad) return res.status(400).json({ mensaje: 'Falta codactividad' });
+
+  try {
+    const rows = await sequelize.query(`
+      SELECT 
+        aa.codasistencia,
+        DATE_FORMAT(aa.fecha, '%d/%m/%Y') as fecha,
+        DAYNAME(aa.fecha) as dia_semana,
+        aa.estado,
+        aa.observacion                
+      FROM actividades_asistencia aa
+      WHERE aa.codpersona = :codpersona
+        AND aa.codactividad = :codactividad
+        AND aa.estado = 'A'
+        AND aa.fecha >= DATE_SUB(CURDATE(), INTERVAL :dias DAY)
+      ORDER BY aa.fecha DESC
+    `, {
+      replacements: { codpersona, codactividad, dias },
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    res.json({
+      asistencias: rows,
+      dias_consultados: dias,
+      total_historico: rows.length > 0 ? rows[0].total_historico : 0
+    });
+
+  } catch (error) {
+    console.error('Error en historial_asistencias:', error);
+    res.status(500).json({ mensaje: 'Error interno del servidor' });
+  }
+});
+
 app.post('/personas_division', verificarToken, async (req, res) => {
   let { coddivision } = req.body;
 
@@ -262,6 +528,125 @@ app.post('/personas_division', verificarToken, async (req, res) => {
 });
 
 
+app.post('/historial_asistencia_actividades', verificarToken, async (req, res) => {
+  const { 
+    coddivisiones, // Array de divisiones ej: [12, 13] (puede venir vacío o no venir)
+    codactividad, 
+    esperado = 3, // Valor por defecto 3
+    dias = 90 // Valor por defecto 90 días
+  } = req.body;
+  
+  // Validaciones básicas
+  if (!codactividad) return res.status(400).json({ mensaje: 'Falta codactividad' });
+
+  try {
+    let query = `
+      SELECT 
+        p.codpersona,
+        p.nombre AS persona,
+        semanas.semana,
+        COUNT(*) AS asistencias,
+        :esperado AS esperado,
+        CONCAT(ROUND((COUNT(*) / :esperado) * 100, 2), '%') AS \`% asistencia\`
+    `;
+    
+    // Agregar coddivision al SELECT solo si se está filtrando por divisiones
+    if (coddivisiones && coddivisiones.length > 0) {
+      query = `
+        SELECT 
+          p.codpersona,
+          p.nombre AS persona,
+          pd.coddivision,
+          semanas.semana,
+          COUNT(*) AS asistencias,
+          :esperado AS esperado,
+          CONCAT(ROUND((COUNT(*) / :esperado) * 100, 2), '%') AS \`% asistencia\`
+      `;
+    }
+    
+    query += `
+      FROM (
+        SELECT 
+          aa.codpersona,
+          aa.fecha,
+          CONCAT(
+            DATE_FORMAT(DATE_SUB(aa.fecha, INTERVAL (WEEKDAY(aa.fecha)) DAY), '%d/%m/%y'),
+            '-',
+            DATE_FORMAT(DATE_ADD(aa.fecha, INTERVAL (6 - WEEKDAY(aa.fecha)) DAY), '%d/%m/%y')
+          ) AS semana,
+          YEARWEEK(aa.fecha, 1) AS num_semana
+        FROM actividades_asistencia aa
+        WHERE aa.codactividad = :codactividad 
+          AND aa.estado = 'A'
+          AND aa.fecha >= DATE_SUB(CURDATE(), INTERVAL :dias DAY)
+      ) semanas
+      INNER JOIN personas p ON p.codpersona = semanas.codpersona
+    `;
+    
+    const replacements = {
+      codactividad,
+      esperado,
+      dias
+    };
+    
+    let groupBy = 'GROUP BY p.codpersona, p.nombre, semanas.semana, semanas.num_semana';
+    
+    if (coddivisiones && coddivisiones.length > 0) {
+      query += `
+        INNER JOIN personas_divisiones pd ON pd.codpersona = p.codpersona
+        WHERE pd.coddivision IN (:coddivisiones)
+      `;
+      replacements.coddivisiones = coddivisiones;
+      groupBy = 'GROUP BY p.codpersona, p.nombre, pd.coddivision, semanas.semana, semanas.num_semana';
+    }
+    
+    query += `
+      ${groupBy}
+      ORDER BY 
+        p.nombre DESC,
+        MIN(semanas.fecha) ASC
+    `;
+
+    console.log('Query final:', query); // Para debug
+    console.log('Replacements:', replacements); // Para debug
+
+    const rows = await sequelize.query(query, {
+      replacements,
+      type: sequelize.QueryTypes.SELECT
+    });
+
+    // Procesar los resultados
+    const resultado = {
+      parametros_consulta: {
+        coddivisiones: coddivisiones || 'Todas las divisiones',
+        codactividad,
+        esperado,
+        dias_consultados: dias
+      },
+      resumen_global: {
+        total_personas: [...new Set(rows.map(r => r.codpersona))].length,
+        total_asistencias: rows.reduce((sum, r) => sum + r.asistencias, 0),
+        total_semanas: [...new Set(rows.map(r => r.semana))].length
+      },
+      detalle: rows
+    };
+
+    // Si no se filtró por divisiones, no incluir coddivision en el detalle
+    if (!coddivisiones || coddivisiones.length === 0) {
+      resultado.detalle = rows.map(({ coddivision, ...rest }) => rest);
+    }
+
+    res.json(resultado);
+
+  } catch (error) {
+    console.error('Error en historial_asistencia_actividades:', error);
+    res.status(500).json({ 
+      mensaje: 'Error interno del servidor',
+      error: error.message 
+    });
+  }
+});
+
 app.post('/divisiones_persona', async (req, res) => {
   const { codpersona, coddisciplina, codclub } = req.body;
 
@@ -301,83 +686,127 @@ app.post('/asistencias_divisiones', async (req, res) => {
   }
 
   if (!Array.isArray(coddivisiones) || coddivisiones.length === 0) {
-
     return res.status(400).json({ mensaje: 'Faltan divisiones' });
   }
 
   try {
-    // Construimos la condición de divisiones solo si hay datos
+    // Construimos la condición de divisiones
     let whereDivision = '';
-    const replacements = { fecha_desde, fecha_hasta };
+    const replacements = { 
+      fecha_desde, 
+      fecha_hasta 
+    };
 
     if (Array.isArray(coddivisiones) && coddivisiones.length > 0) {
       whereDivision = 'AND dd.coddivision IN (:coddivisiones)';
       replacements.coddivisiones = coddivisiones;
     }
 
-    const rows = await sequelize.query(
-      `
-
+    // Consulta SQL completa con parámetros
+    const sqlQuery = `
       WITH ranked_events AS (
-    SELECT 
-        e.codevento,
-        e.fecha,
-        dd.coddivision,
-        p.codpersona,
-        p.nombre,
-        p.apodo,
-        d.asistencia AS codigo_asistencia,
-        CASE d.asistencia
-            WHEN 'P'  THEN 'Presente'
-            WHEN 'PN' THEN 'Presente no entrena'
-            WHEN 'A'  THEN 'Ausente con aviso'
-            WHEN 'AA' THEN 'Ausente sin aviso'
-            ELSE 'Desconocido'
-        END AS asistencia,
-        CASE e.estado
-            WHEN 'A' THEN 'ACTIVO'
-            WHEN 'B' THEN 'BAJA'
-            WHEN 'F' THEN 'FINALIZADO'
-            WHEN 'S' THEN 'SUSPENDIDO'
-        END AS estado_evento,
-        r.descripcion rol,
-        ROW_NUMBER() OVER (PARTITION BY e.codevento, p.codpersona ORDER BY dd.coddivision) AS rn
-    FROM eventos e
-    INNER JOIN det_evento d ON d.codevento = e.codevento
-    INNER JOIN det_evento_division dd ON dd.codevento = e.codevento
-    INNER JOIN personas p ON p.codpersona = d.codpersona
-    LEFT JOIN roles r ON r.codrol = p.codrol
-    WHERE e.fecha BETWEEN :fecha_desde AND :fecha_hasta
-        ${whereDivision}
-        AND r.descripcion = 'Jugador' 
-        AND e.estado = 'F' and p.estado <> 6
-)
-SELECT 
-    codevento,
-    fecha,
-    coddivision,
-    codpersona,
-    nombre,
-    apodo,
-    codigo_asistencia,
-    asistencia,
-    estado_evento,
-    rol
-FROM ranked_events
-WHERE rn = 1
-ORDER BY nombre
-      `,
+        SELECT 
+            e.codevento,
+            e.fecha,
+            dd.coddivision,
+            p.codpersona,
+            p.nombre,
+            p.apodo,
+            d.asistencia AS codigo_asistencia,
+            CASE d.asistencia
+                WHEN 'P'  THEN 'Presente'
+                WHEN 'PN' THEN 'Presente no entrena'
+                WHEN 'A'  THEN 'Ausente con aviso'
+                WHEN 'AA' THEN 'Ausente sin aviso'
+                ELSE 'Desconocido'
+            END AS asistencia,
+            CASE e.estado
+                WHEN 'A' THEN 'ACTIVO'
+                WHEN 'B' THEN 'BAJA'
+                WHEN 'F' THEN 'FINALIZADO'
+                WHEN 'S' THEN 'SUSPENDIDO'
+            END AS estado_evento,
+            r.descripcion rol,
+            ROW_NUMBER() OVER (PARTITION BY e.codevento, p.codpersona ORDER BY dd.coddivision) AS rn
+        FROM eventos e
+        INNER JOIN det_evento d ON d.codevento = e.codevento
+        INNER JOIN det_evento_division dd ON dd.codevento = e.codevento
+        INNER JOIN personas p ON p.codpersona = d.codpersona
+        INNER JOIN personas_divisiones pdv ON pdv.coddivision = dd.coddivision AND pdv.codpersona = p.codpersona
+        LEFT JOIN roles r ON r.codrol = pdv.codrol
+        WHERE e.fecha BETWEEN :fecha_desde AND :fecha_hasta
+            ${whereDivision}
+            AND r.descripcion = 'Jugador' 
+            AND e.estado = 'F' 
+            AND p.estado <> 6
+      )
+      SELECT 
+          codevento,
+          fecha,
+          coddivision,
+          codpersona,
+          nombre,
+          apodo,
+          codigo_asistencia,
+          asistencia,
+          estado_evento,
+          rol
+      FROM ranked_events
+      WHERE rn = 1
+      ORDER BY nombre
+    `;
+
+    // Imprimir la consulta con los valores reales (solo una vez)
+    console.log('\n=== CONSULTA SQL CON VALORES REALES ===');
+    
+    // Creamos una versión de la consulta con los valores reemplazados para mostrarla
+    let sqlParaMostrar = sqlQuery;
+    
+    // Reemplazar :fecha_desde y :fecha_hasta
+    sqlParaMostrar = sqlParaMostrar.replace(':fecha_desde', `'${fecha_desde}'`);
+    sqlParaMostrar = sqlParaMostrar.replace(':fecha_hasta', `'${fecha_hasta}'`);
+    
+    // Reemplazar :coddivisiones si existe
+    if (coddivisiones.length > 0) {
+      const divisionesStr = coddivisiones.map(d => d).join(', ');
+      sqlParaMostrar = sqlParaMostrar.replace(':coddivisiones', divisionesStr);
+    }
+    
+    console.log(sqlParaMostrar);
+    console.log('=======================================\n');
+    
+    // También mostramos los parámetros por separado
+    console.log('📌 PARÁMETROS DE LA CONSULTA:');
+    console.log('   Fecha desde:', fecha_desde);
+    console.log('   Fecha hasta:', fecha_hasta);
+    console.log('   Divisiones:', coddivisiones);
+    console.log('=======================================\n');
+
+    // Ejecutar la consulta con logging condicional
+    let queryEjecutada = false; // Flag para controlar el logging
+    
+    const rows = await sequelize.query(
+      sqlQuery,
       {
         replacements,
-        type: sequelize.QueryTypes.SELECT
+        type: sequelize.QueryTypes.SELECT,
+        logging: (sql) => {
+          // Solo mostrar el logging de Sequelize una vez
+          if (!queryEjecutada) {
+            console.log('\n🔍 SQL EJECUTADO POR SEQUELIZE:');
+            console.log(sql);
+            console.log('=======================================\n');
+            queryEjecutada = true;
+          }
+        }
       }
     );
 
+    console.log(`✅ Resultados obtenidos: ${rows.length} registros`);
     res.json(rows);
-    console.log(rows);
 
   } catch (err) {
-    console.error('Error en /asistencias_divisiones:', err);
+    console.error('❌ Error en /asistencias_divisiones:', err);
     res.status(500).json({
       mensaje: 'Error interno',
       error: err.message
@@ -470,7 +899,7 @@ const [[{ codevento }]] = await sequelize.query(
         INNER JOIN personas_divisiones pd 
           ON pd.codpersona = p.codpersona
         WHERE pd.coddivision = :coddivision
-          AND p.estado <> 6
+          AND p.estado <> 6 and p.estado <> 0
         `,
         {
           replacements: { coddivision },
@@ -627,10 +1056,10 @@ app.post("/evento_estado", verificarToken, async (req, res) => {
   }
 
   // Validar que el tipo sea un estado válido
-  const estadosValidos = ['A', 'I', 'F', 'C']; // Activo, Inactivo, Finalizado, Cancelado
+  const estadosValidos = ['A', 'I', 'F', 'C', 'B']; // Activo, Inactivo, Finalizado, Cancelado, Eliminado o Baja
   if (!estadosValidos.includes(tipo)) {
     return res.status(400).json({ 
-      error: "Tipo de estado no válido. Debe ser: A, I, F o C" 
+      error: "Tipo de estado no válido. Debe ser: A, I, F, B, o C" 
     });
   }
 
