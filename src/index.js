@@ -2498,7 +2498,8 @@ const [[{ codevento }]] = await sequelize.query(
       INNER JOIN personas_divisiones pd
         ON pd.codpersona = p.codpersona
       WHERE pd.coddivision IN (:coddivisionesPool)
-        AND p.estado <> 6 and p.estado <> 0
+        AND pd.codrol = 1
+        AND p.estado <> 6
       `,
       {
         replacements: { coddivisionesPool },
@@ -2596,6 +2597,34 @@ app.post("/evento_convocatoria", verificarToken, async (req, res) => {
       ? divisionesEvento.map((d) => d.coddivision)
       : [0];
 
+    // Backfill: incluir jugadores que se hayan sumado a la división después de
+    // creado el evento (en ese momento det_evento queda como una foto fija).
+    const poolActual = await sequelize.query(
+      `
+      SELECT DISTINCT p.codpersona
+      FROM personas p
+      INNER JOIN personas_divisiones pd ON pd.codpersona = p.codpersona
+      WHERE pd.coddivision IN (:familiaPool)
+        AND pd.codrol = 1
+        AND p.estado <> 6
+      `,
+      { replacements: { familiaPool }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    const yaEnEvento = await sequelize.query(
+      `SELECT codpersona FROM det_evento WHERE codevento = :codevento`,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+    const idsYaEnEvento = new Set(yaEnEvento.map((r) => r.codpersona));
+
+    const faltantes = poolActual.filter((p) => !idsYaEnEvento.has(p.codpersona));
+    for (const p of faltantes) {
+      await sequelize.query(
+        `INSERT INTO det_evento (codevento, codpersona, asistencia) VALUES (:codevento, :codpersona, 'I')`,
+        { replacements: { codevento, codpersona: p.codpersona } }
+      );
+    }
+
     const jugadores = await sequelize.query(
       `
       SELECT j.codpersona, j.nombre, j.apodo, j.convocatoria, j.coddivision,
@@ -2612,6 +2641,12 @@ app.post("/evento_convocatoria", verificarToken, async (req, res) => {
         FROM det_evento de
         INNER JOIN personas p ON p.codpersona = de.codpersona
         WHERE de.codevento = :codevento
+          AND EXISTS (
+            SELECT 1 FROM personas_divisiones pd2
+            WHERE pd2.codpersona = de.codpersona
+              AND pd2.coddivision IN (:familiaPool)
+              AND pd2.codrol = 1
+          )
       ) j
       LEFT JOIN divisiones dv ON dv.coddivision = j.coddivision
       ORDER BY j.apodo, j.nombre
