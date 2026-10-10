@@ -19,6 +19,56 @@ sequelize.authenticate()
 
 console.log('Servidor arrancado, antes de endpoints');
 
+// ===================================================
+// Al asignar una persona a una división, la sumamos a
+// los eventos activos (no finalizados, no cancelados)
+// de esa "familia" de divisiones (padre + sub-divisiones),
+// igual criterio que usa /nuevo_evento para armar el pool.
+// ===================================================
+async function agregarPersonaAEventosActivos(codpersona, coddivision, transaction) {
+  const [division] = await sequelize.query(
+    `SELECT coddivision_padre FROM divisiones WHERE coddivision = :coddivision`,
+    { replacements: { coddivision }, type: sequelize.QueryTypes.SELECT, transaction }
+  );
+
+  const raiz = division?.coddivision_padre || coddivision;
+
+  const hijos = await sequelize.query(
+    `SELECT coddivision FROM divisiones WHERE coddivision_padre = :raiz`,
+    { replacements: { raiz }, type: sequelize.QueryTypes.SELECT, transaction }
+  );
+
+  const familia = [...new Set([raiz, coddivision, ...hijos.map((h) => h.coddivision)])];
+
+  const eventos = await sequelize.query(
+    `
+    SELECT DISTINCT e.codevento
+    FROM eventos e
+    INNER JOIN det_evento_division ded ON ded.codevento = e.codevento
+    WHERE e.estado = 'A'
+      AND (
+        (e.tipo = 'P' AND ded.coddivision IN (:familia))
+        OR (e.tipo <> 'P' AND ded.coddivision = :coddivision)
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM det_evento de
+        WHERE de.codevento = e.codevento AND de.codpersona = :codpersona
+      )
+    `,
+    {
+      replacements: { familia, coddivision, codpersona },
+      type: sequelize.QueryTypes.SELECT,
+      transaction,
+    }
+  );
+
+  for (const ev of eventos) {
+    await sequelize.query(
+      `INSERT INTO det_evento (codevento, codpersona, asistencia) VALUES (:codevento, :codpersona, 'I')`,
+      { replacements: { codevento: ev.codevento, codpersona }, transaction }
+    );
+  }
+}
 
 // ===================================================
 // ===============  LOGIN UNIFICADO ==================
@@ -96,7 +146,7 @@ app.post('/login', async (req, res) => {
       const token = jwt.sign(
         { id: usuario.codpersona, email: usuario.email, usuario: usuario.usuario },
         process.env.JWT_SECRET || 'secreto123',
-        { expiresIn: '1h' }
+        { expiresIn: '18h' }
       );
 
       await sequelize.query(
@@ -208,13 +258,131 @@ app.post('/disciplinas_club', verificarToken, async (req, res) => {
   try {
     const rows = await sequelize.query(
       `
-      SELECT d.coddisciplina, d.descripcion
+      SELECT d.coddisciplina, d.descripcion, d.cant_titulares, d.cant_suplentes
       FROM disciplinas d
       INNER JOIN clubes_disciplinas cd ON d.coddisciplina = cd.coddisciplina
       WHERE cd.codclub = :codclub
       `,
       {
         replacements: { codclub },
+        type: sequelize.QueryTypes.SELECT
+      }
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+
+// ===================================================
+// DISCIPLINAS: listado completo (para administración de clubes)
+// ===================================================
+app.post('/disciplinas_todas', verificarToken, async (req, res) => {
+  try {
+    const rows = await sequelize.query(
+      `SELECT coddisciplina, descripcion FROM disciplinas ORDER BY descripcion`,
+      { type: sequelize.QueryTypes.SELECT }
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ===================================================
+// CLUBES: listado para administración (con sus disciplinas)
+// ===================================================
+app.post('/clubes_admin', verificarToken, async (req, res) => {
+  try {
+    const rows = await sequelize.query(
+      `
+      SELECT
+        c.codclub,
+        c.descripcion,
+        c.estado,
+        c.escudo,
+        COALESCE((
+          SELECT JSON_ARRAYAGG(cd.coddisciplina)
+          FROM clubes_disciplinas cd
+          WHERE cd.codclub = c.codclub
+        ), JSON_ARRAY()) AS coddisciplinas
+      FROM clubes c
+      WHERE c.estado <> 'B'
+      ORDER BY c.descripcion
+      `,
+      { type: sequelize.QueryTypes.SELECT }
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ===================================================
+// CLUBES: guardar las disciplinas que practica un club
+// ===================================================
+app.post('/club_disciplinas_guardar', verificarToken, async (req, res) => {
+  const { codclub, coddisciplinas } = req.body;
+
+  if (!codclub || !Array.isArray(coddisciplinas)) {
+    return res.status(400).json({ mensaje: 'Faltan parámetros' });
+  }
+
+  const t = await sequelize.transaction();
+
+  try {
+    await sequelize.query(
+      `DELETE FROM clubes_disciplinas WHERE codclub = :codclub`,
+      { replacements: { codclub }, transaction: t }
+    );
+
+    for (const coddisciplina of coddisciplinas) {
+      await sequelize.query(
+        `INSERT INTO clubes_disciplinas (codclub, coddisciplina) VALUES (:codclub, :coddisciplina)`,
+        { replacements: { codclub, coddisciplina }, transaction: t }
+      );
+    }
+
+    await t.commit();
+    res.json({ ok: true });
+  } catch (error) {
+    await t.rollback();
+    console.error(error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ===================================================
+// CLUBES: listado de rivales posibles para una disciplina
+// (para elegir el rival al crear un partido)
+// ===================================================
+app.post('/clubes_por_disciplina', verificarToken, async (req, res) => {
+  const { coddisciplina, codclub_excluir } = req.body;
+
+  if (!coddisciplina) {
+    return res.status(400).json({ mensaje: 'Falta coddisciplina' });
+  }
+
+  try {
+    const rows = await sequelize.query(
+      `
+      SELECT c.codclub, c.descripcion, c.escudo
+      FROM clubes c
+      INNER JOIN clubes_disciplinas cd ON cd.codclub = c.codclub
+      WHERE cd.coddisciplina = :coddisciplina
+        AND c.estado <> 'B'
+        ${codclub_excluir ? "AND c.codclub <> :codclub_excluir" : ""}
+      ORDER BY c.descripcion
+      `,
+      {
+        replacements: { coddisciplina, codclub_excluir },
         type: sequelize.QueryTypes.SELECT
       }
     );
@@ -263,29 +431,184 @@ app.post('/divisiones_disciplina_old', verificarToken, async (req, res) => {
 // ============================================
 app.post('/divisiones_disciplina', verificarToken, async (req, res) => {
   const { coddisciplina, codclub } = req.body;
-  
+
   console.log("Buscando divisiones para disciplina:", coddisciplina, "y club:", codclub);
-  
+
   try {
     const divisiones = await sequelize.query(
-      `SELECT coddivision, descripcion 
-       FROM divisiones 
-       WHERE coddisciplina = :coddisciplina 
-         AND codclub = :codclub 
+      `SELECT coddivision, descripcion, coddivision_padre
+       FROM divisiones
+       WHERE coddisciplina = :coddisciplina
+         AND codclub = :codclub
          AND estado = 'A'`,
       {
-        replacements: { 
-          coddisciplina, 
-          codclub 
+        replacements: {
+          coddisciplina,
+          codclub
         },
         type: sequelize.QueryTypes.SELECT
       }
     );
-    
+
     console.log("Divisiones encontradas:", divisiones.length);
     res.json(divisiones);
   } catch (error) {
     console.error("Error en /divisiones_disciplina:", error);
+    res.status(500).json({ mensaje: 'Error interno del servidor' });
+  }
+});
+
+// ============================================
+// ENDPOINT: Crear o editar una división
+// ============================================
+app.post('/division_guardar', verificarToken, async (req, res) => {
+  const {
+    coddivision,
+    descripcion,
+    coddisciplina,
+    codclub,
+    coddivision_padre,
+    estado
+  } = req.body;
+
+  if (!descripcion || !descripcion.trim()) {
+    return res.status(400).json({ mensaje: 'Falta descripcion' });
+  }
+  if (!coddisciplina) {
+    return res.status(400).json({ mensaje: 'Falta coddisciplina' });
+  }
+  if (!codclub) {
+    return res.status(400).json({ mensaje: 'Falta codclub' });
+  }
+
+  const coddivisionSafe = parseInt(coddivision) || 0;
+  const padre = coddivision_padre ? parseInt(coddivision_padre) : null;
+
+  try {
+    // ==========================
+    // VALIDAR PADRE (si se especifica)
+    // ==========================
+    if (padre) {
+      if (padre === coddivisionSafe) {
+        return res.status(400).json({ mensaje: 'Una división no puede ser su propia sub-división' });
+      }
+
+      const [divisionPadre] = await sequelize.query(
+        `SELECT coddivision, coddivision_padre
+         FROM divisiones
+         WHERE coddivision = :padre AND coddisciplina = :coddisciplina AND codclub = :codclub`,
+        {
+          replacements: { padre, coddisciplina, codclub },
+          type: sequelize.QueryTypes.SELECT
+        }
+      );
+
+      if (!divisionPadre) {
+        return res.status(400).json({ mensaje: 'La división padre indicada no existe en este club/disciplina' });
+      }
+
+      if (divisionPadre.coddivision_padre) {
+        return res.status(400).json({ mensaje: 'No se permite anidar sub-divisiones a más de un nivel' });
+      }
+
+      // Si estoy editando, no puedo asignarme como padre a uno de mis propios hijos
+      if (coddivisionSafe) {
+        const [hijoExistente] = await sequelize.query(
+          `SELECT coddivision FROM divisiones WHERE coddivision_padre = :coddivisionSafe LIMIT 1`,
+          { replacements: { coddivisionSafe }, type: sequelize.QueryTypes.SELECT }
+        );
+        if (hijoExistente) {
+          return res.status(400).json({ mensaje: 'Esta división ya tiene sub-divisiones propias, no puede pasar a ser sub-división de otra' });
+        }
+      }
+    }
+
+    let divisionId = coddivisionSafe;
+
+    if (coddivisionSafe === 0) {
+      // ==========================
+      // CREAR DIVISIÓN
+      // ==========================
+      const [result] = await sequelize.query(
+        `INSERT INTO divisiones (descripcion, coddisciplina, codclub, coddivision_padre, estado)
+         VALUES (?, ?, ?, ?, ?)`,
+        {
+          replacements: [
+            descripcion.trim(),
+            coddisciplina,
+            codclub,
+            padre,
+            estado || 'A'
+          ],
+          type: sequelize.QueryTypes.INSERT
+        }
+      );
+      divisionId = result;
+    } else {
+      // ==========================
+      // EDITAR DIVISIÓN
+      // ==========================
+      await sequelize.query(
+        `UPDATE divisiones
+         SET descripcion = ?, coddivision_padre = ?, estado = ?
+         WHERE coddivision = ? AND coddisciplina = ? AND codclub = ?`,
+        {
+          replacements: [
+            descripcion.trim(),
+            padre,
+            estado || 'A',
+            coddivisionSafe,
+            coddisciplina,
+            codclub
+          ]
+        }
+      );
+    }
+
+    res.json({ mensaje: 'División guardada correctamente', coddivision: divisionId });
+  } catch (error) {
+    console.error('Error en /division_guardar:', error);
+    res.status(500).json({ mensaje: 'Error interno del servidor' });
+  }
+});
+
+// ============================================
+// ENDPOINT: Dar de baja una división
+// ============================================
+app.post('/divisiones_baja', verificarToken, async (req, res) => {
+  const { coddivision } = req.body;
+
+  if (!coddivision) {
+    return res.status(400).json({ mensaje: 'Falta coddivision' });
+  }
+
+  try {
+    const [hijoActivo] = await sequelize.query(
+      `SELECT coddivision FROM divisiones WHERE coddivision_padre = :coddivision AND estado = 'A' LIMIT 1`,
+      { replacements: { coddivision }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (hijoActivo) {
+      return res.status(400).json({ mensaje: 'No se puede dar de baja: tiene sub-divisiones activas' });
+    }
+
+    const [personaAsignada] = await sequelize.query(
+      `SELECT codpersona FROM personas_divisiones WHERE coddivision = :coddivision LIMIT 1`,
+      { replacements: { coddivision }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (personaAsignada) {
+      return res.status(400).json({ mensaje: 'No se puede dar de baja: tiene jugadores/personas asignadas a esta división' });
+    }
+
+    await sequelize.query(
+      `UPDATE divisiones SET estado = 'B' WHERE coddivision = :coddivision`,
+      { replacements: { coddivision } }
+    );
+
+    res.json({ mensaje: 'División dada de baja correctamente' });
+  } catch (error) {
+    console.error('Error en /divisiones_baja:', error);
     res.status(500).json({ mensaje: 'Error interno del servidor' });
   }
 });
@@ -520,6 +843,8 @@ app.post('/importar_personas_masivo', verificarToken, async (req, res) => {
           );
           asociaciones_division_nuevas++;
           console.log(`Asociación división creada: ${codpersona} -> división ${persona.coddivision} con rol ${persona.codrol}`);
+
+          await agregarPersonaAEventosActivos(codpersona, persona.coddivision, t);
         } else {
           // Ya está en la división, verificamos si hay que actualizar el rol
           asociaciones_division_existentes++;
@@ -834,6 +1159,8 @@ app.post('/persona_guardar', verificarToken, async (req, res) => {
         }
       );
 
+      await agregarPersonaAEventosActivos(personaId, div.coddivision, t);
+
     }
 
     await t.commit();
@@ -857,7 +1184,7 @@ app.post('/persona_guardar', verificarToken, async (req, res) => {
 
 });
 app.post('/personas_club', verificarToken, async (req, res) => { 
-  const { codclub, coddisciplina, filtro, soloSinDivision } = req.body; // 👈 Agregamos soloSinDivision
+  const { codclub, coddisciplina, filtro, soloSinDivision, soloJugadores } = req.body; // 👈 Agregamos soloSinDivision
 
   if (!codclub) {
     return res.status(400).json({ mensaje: 'Falta codclub' });
@@ -891,11 +1218,23 @@ app.post('/personas_club', verificarToken, async (req, res) => {
 
     // 🔹 NUEVO: Filtrar personas que NO están en ninguna división
     if (soloSinDivision) {
-      whereConditions += ` 
+      whereConditions += `
         AND NOT EXISTS (
-          SELECT 1 
-          FROM personas_divisiones pd3 
+          SELECT 1
+          FROM personas_divisiones pd3
           WHERE pd3.codpersona = p.codpersona
+        )
+      `;
+    }
+
+    // 🔹 NUEVO: Filtrar solo personas con rol de jugador en alguna división
+    if (soloJugadores) {
+      whereConditions += `
+        AND EXISTS (
+          SELECT 1
+          FROM personas_divisiones pd4
+          WHERE pd4.codpersona = p.codpersona
+          AND pd4.codrol = 1
         )
       `;
     }
@@ -1596,12 +1935,13 @@ app.post('/historial_asistencia_actividadesOld16042026', verificarToken, async (
 });
 
 app.post('/historial_asistencia_actividades', verificarToken, async (req, res) => {
-  const { 
+  const {
     coddivisiones,
-    codactividad, 
+    codactividad,
     fecha_desde,
     fecha_hasta,
-    codpersona
+    codpersona,
+    codpersonas
   } = req.body;
 
   console.log("FECHADESDE**", fecha_desde);
@@ -1642,14 +1982,14 @@ app.post('/historial_asistencia_actividades', verificarToken, async (req, res) =
     console.log('📅 Fecha hasta:', fechaHastaSQL);
 
     if (fechaDesdeSQL > fechaHastaSQL) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         mensaje: 'La fecha_desde no puede ser mayor que fecha_hasta'
       });
     }
 
     // 🔥 QUERY CON JOIN PARA TRAER NOMBRE Y APODO
     let sql = `
-      SELECT 
+      SELECT
         aa.codpersona,
         p.nombre,
         p.apodo,
@@ -1676,12 +2016,17 @@ app.post('/historial_asistencia_actividades', verificarToken, async (req, res) =
     if (coddivisiones && coddivisiones.length > 0) {
       sql += `
         AND aa.codpersona IN (
-          SELECT codpersona 
-          FROM personas_divisiones 
+          SELECT codpersona
+          FROM personas_divisiones
           WHERE coddivision IN (:coddivisiones)
         )
       `;
       replacements.coddivisiones = coddivisiones;
+    }
+
+    if (codpersonas && codpersonas.length > 0) {
+      sql += ` AND aa.codpersona IN (:codpersonas)`;
+      replacements.codpersonas = codpersonas;
     }
 
     sql += ` ORDER BY aa.fecha ASC`;
@@ -1722,7 +2067,7 @@ app.post('/divisiones_persona', async (req, res) => {
 
   try {
     const rows = await sequelize.query(
-      `SELECT di.coddivision, di.descripcion
+      `SELECT di.coddivision, di.descripcion, di.coddivision_padre
        FROM divisiones di
        INNER JOIN personas_divisiones pd ON di.coddivision = pd.coddivision
        WHERE pd.codpersona = :codpersona
@@ -1747,13 +2092,16 @@ app.post('/divisiones_persona', async (req, res) => {
 
 
 app.post('/asistencias_divisiones', async (req, res) => {
-  const { fecha_desde, fecha_hasta, coddivisiones, codpersona } = req.body;
+  const { fecha_desde, fecha_hasta, coddivisiones, codpersona, codpersonas } = req.body;
 
   if (!fecha_desde || !fecha_hasta) {
     return res.status(400).json({ mensaje: 'Faltan fechas' });
   }
 
-  if (!Array.isArray(coddivisiones) || coddivisiones.length === 0) {
+  const tieneDivisiones = Array.isArray(coddivisiones) && coddivisiones.length > 0;
+  const tienePersonas = Array.isArray(codpersonas) && codpersonas.length > 0;
+
+  if (!tieneDivisiones && !tienePersonas && !codpersona) {
     return res.status(400).json({ mensaje: 'Faltan divisiones' });
   }
 
@@ -1761,18 +2109,29 @@ app.post('/asistencias_divisiones', async (req, res) => {
     // Construimos la condición de divisiones y persona
     let whereDivision = '';
     let wherePersona = '';
-    const replacements = { 
-      fecha_desde, 
-      fecha_hasta 
+    // Por default (hay coddivisiones), la persona tiene que pertenecer a esa misma división del evento.
+    // Sin coddivisiones (modo grupo, o drill-down de una sola persona sin contexto de división) no exigimos eso,
+    // porque la persona puede pertenecer a una división distinta a la del evento.
+    let joinPersonasDivisiones = tieneDivisiones
+      ? 'INNER JOIN personas_divisiones pdv ON pdv.coddivision = dd.coddivision AND pdv.codpersona = p.codpersona'
+      : 'INNER JOIN personas_divisiones pdv ON pdv.codpersona = p.codpersona';
+    const replacements = {
+      fecha_desde,
+      fecha_hasta
     };
 
-    if (Array.isArray(coddivisiones) && coddivisiones.length > 0) {
+    if (tieneDivisiones) {
       whereDivision = 'AND dd.coddivision IN (:coddivisiones)';
       replacements.coddivisiones = coddivisiones;
     }
 
+    if (tienePersonas) {
+      wherePersona = 'AND p.codpersona IN (:codpersonas)';
+      replacements.codpersonas = codpersonas;
+    }
+
     if (codpersona) {
-      wherePersona = 'AND p.codpersona = :codpersona';
+      wherePersona += ' AND p.codpersona = :codpersona';
       replacements.codpersona = codpersona;
     }
 
@@ -1806,7 +2165,7 @@ app.post('/asistencias_divisiones', async (req, res) => {
         INNER JOIN det_evento d ON d.codevento = e.codevento
         INNER JOIN det_evento_division dd ON dd.codevento = e.codevento
         INNER JOIN personas p ON p.codpersona = d.codpersona
-        INNER JOIN personas_divisiones pdv ON pdv.coddivision = dd.coddivision AND pdv.codpersona = p.codpersona
+        ${joinPersonasDivisiones}
         LEFT JOIN roles r ON r.codrol = pdv.codrol
         WHERE e.fecha BETWEEN :fecha_desde AND :fecha_hasta
             ${whereDivision}
@@ -2055,7 +2414,7 @@ app.post("/evento_asistencia", verificarToken, async (req, res) => {
 
 
 app.post("/nuevo_evento", verificarToken, async (req, res) => {
-  const { fecha, hora, observacion, divisiones, tipo, subtipo } = req.body;
+  const { fecha, hora, observacion, divisiones, tipo, subtipo, coddisciplina, codclub, codclub_rival } = req.body;
 
   const fechaHora =
     fecha && hora ? `${fecha} ${hora}` : fecha ? `${fecha} 00:00:00` : null;
@@ -2068,11 +2427,16 @@ app.post("/nuevo_evento", verificarToken, async (req, res) => {
     // insertar evento
 await sequelize.query(
   `
-  INSERT INTO eventos (fecha, tipo, sub_tipo, observacion, estado)
-  VALUES (:fecha, :tipo, :subtipo, :observacion, 'A')
+  INSERT INTO eventos (fecha, tipo, sub_tipo, observacion, estado, coddisciplina, codclub, codclub_rival)
+  VALUES (:fecha, :tipo, :subtipo, :observacion, 'A', :coddisciplina, :codclub, :codclub_rival)
   `,
   {
-    replacements: { fecha: fechaHora, tipo, subtipo, observacion },
+    replacements: {
+      fecha: fechaHora, tipo, subtipo, observacion,
+      coddisciplina: coddisciplina || null,
+      codclub: codclub || null,
+      codclub_rival: codclub_rival || null,
+    },
     transaction: t,
   }
 );
@@ -2084,9 +2448,8 @@ const [[{ codevento }]] = await sequelize.query(
 );
 
 
-    // 2️⃣ Por cada división
+    // 2️⃣ Vincular las divisiones seleccionadas al evento
     for (const coddivision of divisiones) {
-      // evento ↔ división
       await sequelize.query(
         `
         INSERT INTO det_evento_division (codevento, coddivision)
@@ -2097,40 +2460,68 @@ const [[{ codevento }]] = await sequelize.query(
           transaction: t,
         }
       );
+    }
 
-      // 3️⃣ Personas de la división
-      const personas = await sequelize.query(
+    // 3️⃣ Calcular el pool de personas a convocar
+    //    - Entrenamiento: las divisiones seleccionadas tal cual
+    //    - Partido: la división "familia" completa (padre + todas sus sub-divisiones),
+    //      para poder convocar a cualquier jugador de la categoría al armar el equipo
+    let coddivisionesPool = [...divisiones];
+
+    if (tipo === 'P') {
+      const familiaSet = new Set();
+
+      for (const coddivision of divisiones) {
+        const [division] = await sequelize.query(
+          `SELECT coddivision_padre FROM divisiones WHERE coddivision = :coddivision`,
+          { replacements: { coddivision }, type: sequelize.QueryTypes.SELECT, transaction: t }
+        );
+
+        const raiz = division?.coddivision_padre || coddivision;
+        familiaSet.add(raiz);
+
+        const hijos = await sequelize.query(
+          `SELECT coddivision FROM divisiones WHERE coddivision_padre = :raiz`,
+          { replacements: { raiz }, type: sequelize.QueryTypes.SELECT, transaction: t }
+        );
+        hijos.forEach((h) => familiaSet.add(h.coddivision));
+      }
+
+      coddivisionesPool = [...familiaSet];
+    }
+
+    // 4️⃣ Personas del pool
+    const personas = await sequelize.query(
+      `
+      SELECT DISTINCT p.codpersona
+      FROM personas p
+      INNER JOIN personas_divisiones pd
+        ON pd.codpersona = p.codpersona
+      WHERE pd.coddivision IN (:coddivisionesPool)
+        AND p.estado <> 6 and p.estado <> 0
+      `,
+      {
+        replacements: { coddivisionesPool },
+        type: sequelize.QueryTypes.SELECT,
+        transaction: t,
+      }
+    );
+
+    // 5️⃣ Insertar personas en det_evento
+    for (const p of personas) {
+      await sequelize.query(
         `
-        SELECT p.codpersona
-        FROM personas p
-        INNER JOIN personas_divisiones pd 
-          ON pd.codpersona = p.codpersona
-        WHERE pd.coddivision = :coddivision
-          AND p.estado <> 6 and p.estado <> 0
+        INSERT INTO det_evento (codevento, codpersona, asistencia)
+        VALUES (:codevento, :codpersona, 'I')
         `,
         {
-          replacements: { coddivision },
-          type: sequelize.QueryTypes.SELECT,
+          replacements: {
+            codevento,
+            codpersona: p.codpersona,
+          },
           transaction: t,
         }
       );
-
-      // 4️⃣ Insertar personas en det_eventos
-      for (const p of personas) {
-        await sequelize.query(
-          `
-          INSERT INTO det_evento (codevento, codpersona, asistencia)
-          VALUES (:codevento, :codpersona, 'I')
-          `,
-          {
-            replacements: {
-              codevento,
-              codpersona: p.codpersona,
-            },
-            transaction: t,
-          }
-        );
-      }
     }
 
     await t.commit();
@@ -2139,6 +2530,298 @@ const [[{ codevento }]] = await sequelize.query(
     await t.rollback();
     console.error(error);
     res.status(500).json({ error: "Error creando evento" });
+  }
+});
+
+// ============================================
+// ENDPOINT: Obtener convocatoria de un evento (partido)
+// ============================================
+app.post("/evento_convocatoria", verificarToken, async (req, res) => {
+  const { codevento } = req.body;
+
+  if (!codevento) {
+    return res.status(400).json({ mensaje: "Falta codevento" });
+  }
+
+  try {
+    const [evento] = await sequelize.query(
+      `
+      SELECT e.codevento, e.tipo, e.fecha, e.estado, e.coddisciplina, d.cant_titulares, d.cant_suplentes,
+             e.codclub, cp.descripcion AS club_descripcion, cp.escudo AS club_escudo,
+             e.codclub_rival, cr.descripcion AS rival_descripcion, cr.escudo AS rival_escudo,
+             e.resultado_rival,
+             e.codusuario_en_vivo, e.codsesion_en_vivo, e.fecha_actividad_en_vivo,
+             pe.nombre AS nombre_usuario_en_vivo, pe.apodo AS apodo_usuario_en_vivo
+      FROM eventos e
+      LEFT JOIN disciplinas d ON d.coddisciplina = e.coddisciplina
+      LEFT JOIN clubes cp ON cp.codclub = e.codclub
+      LEFT JOIN clubes cr ON cr.codclub = e.codclub_rival
+      LEFT JOIN personas pe ON pe.codpersona = e.codusuario_en_vivo
+      WHERE e.codevento = :codevento
+      `,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (!evento) {
+      return res.status(404).json({ mensaje: "Evento no encontrado" });
+    }
+
+    const divisionesEvento = await sequelize.query(
+      `
+      SELECT dv.coddivision, dv.descripcion, dv.coddivision_padre,
+             dvp.descripcion AS division_padre_descripcion
+      FROM det_evento_division ded
+      INNER JOIN divisiones dv ON dv.coddivision = ded.coddivision
+      LEFT JOIN divisiones dvp ON dvp.coddivision = dv.coddivision_padre
+      WHERE ded.codevento = :codevento
+      `,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    // Misma lógica de "familia" que /nuevo_evento, para acotar el tag de división
+    // de cada jugador a la categoría de este partido (y no mostrar otra división
+    // suya no relacionada, ej. una categoría vieja o distinta).
+    const familiaSet = new Set();
+    for (const dv of divisionesEvento) {
+      const raiz = dv.coddivision_padre || dv.coddivision;
+      familiaSet.add(raiz);
+      const hijos = await sequelize.query(
+        `SELECT coddivision FROM divisiones WHERE coddivision_padre = :raiz`,
+        { replacements: { raiz }, type: sequelize.QueryTypes.SELECT }
+      );
+      hijos.forEach((h) => familiaSet.add(h.coddivision));
+    }
+    const familiaPool = familiaSet.size ? [...familiaSet] : [0];
+    const idsSeleccionados = divisionesEvento.length
+      ? divisionesEvento.map((d) => d.coddivision)
+      : [0];
+
+    const jugadores = await sequelize.query(
+      `
+      SELECT j.codpersona, j.nombre, j.apodo, j.convocatoria, j.coddivision,
+             dv.descripcion AS division_descripcion
+      FROM (
+        SELECT de.codpersona, p.nombre, p.apodo, de.convocatoria,
+          (
+            SELECT pd.coddivision FROM personas_divisiones pd
+            WHERE pd.codpersona = de.codpersona
+              AND pd.coddivision IN (:familiaPool)
+            ORDER BY (pd.coddivision IN (:idsSeleccionados)) DESC, pd.coddivision
+            LIMIT 1
+          ) AS coddivision
+        FROM det_evento de
+        INNER JOIN personas p ON p.codpersona = de.codpersona
+        WHERE de.codevento = :codevento
+      ) j
+      LEFT JOIN divisiones dv ON dv.coddivision = j.coddivision
+      ORDER BY j.apodo, j.nombre
+      `,
+      {
+        replacements: { codevento, familiaPool, idsSeleccionados },
+        type: sequelize.QueryTypes.SELECT,
+      }
+    );
+
+    res.json({ evento: { ...evento, divisiones: divisionesEvento }, jugadores });
+  } catch (error) {
+    console.error("Error en /evento_convocatoria:", error);
+    res.status(500).json({ mensaje: "Error interno del servidor" });
+  }
+});
+
+// ============================================
+// ENDPOINT: Guardar convocatoria de un jugador (titular/suplente/no citado)
+// ============================================
+app.post("/evento_convocatoria_actualizar", verificarToken, async (req, res) => {
+  const { codevento, codpersona, convocatoria } = req.body;
+
+  if (!codevento || !codpersona) {
+    return res.status(400).json({ mensaje: "Faltan parámetros" });
+  }
+
+  if (convocatoria !== null && !['T', 'S', 'N'].includes(convocatoria)) {
+    return res.status(400).json({ mensaje: "Convocatoria inválida" });
+  }
+
+  try {
+    const [evento] = await sequelize.query(
+      `SELECT estado FROM eventos WHERE codevento = :codevento`,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (!evento) {
+      return res.status(404).json({ mensaje: "Evento no encontrado" });
+    }
+
+    if (evento.estado === 'F' || evento.estado === 'B') {
+      return res.status(400).json({ mensaje: "No se puede editar la convocatoria de un evento finalizado o eliminado" });
+    }
+
+    await sequelize.query(
+      `
+      UPDATE det_evento
+      SET convocatoria = :convocatoria
+      WHERE codevento = :codevento
+        AND codpersona = :codpersona
+      `,
+      { replacements: { codevento, codpersona, convocatoria } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Error en /evento_convocatoria_actualizar:", error);
+    res.status(500).json({ mensaje: "Error interno del servidor" });
+  }
+});
+
+// ============================================
+// ENDPOINT: Guardar el resultado del rival (se carga a mano)
+// ============================================
+app.post("/evento_resultado_rival_actualizar", verificarToken, async (req, res) => {
+  const { codevento, resultado_rival } = req.body;
+
+  if (!codevento) {
+    return res.status(400).json({ mensaje: "Falta codevento" });
+  }
+
+  try {
+    const [evento] = await sequelize.query(
+      `SELECT estado FROM eventos WHERE codevento = :codevento`,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (!evento) {
+      return res.status(404).json({ mensaje: "Evento no encontrado" });
+    }
+
+    if (evento.estado === 'B') {
+      return res.status(400).json({ mensaje: "No se puede editar un evento eliminado" });
+    }
+
+    await sequelize.query(
+      `UPDATE eventos SET resultado_rival = :resultado_rival WHERE codevento = :codevento`,
+      { replacements: { codevento, resultado_rival: resultado_rival ?? null } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Error en /evento_resultado_rival_actualizar:", error);
+    res.status(500).json({ mensaje: "Error interno del servidor" });
+  }
+});
+
+// ============================================
+// Control de "quién está manejando" un partido en vivo, para que
+// dos usuarios no registren sucesos en simultáneo sobre el mismo evento.
+// Si nadie lo tomó (o el que lo tenía quedó inactivo más de LOCK_TIMEOUT_MS),
+// el que pide el control lo toma. Si no, se devuelve 409 con el nombre de
+// quién lo está manejando, para que el resto quede en modo espectador.
+// ============================================
+const EN_VIVO_LOCK_TIMEOUT_MS = 15 * 60 * 1000;
+
+app.post("/evento_en_vivo_tomar", verificarToken, async (req, res) => {
+  const { codevento, codsesion, forzar } = req.body;
+  const codpersona = req.user.id;
+
+  if (!codevento || !codsesion) {
+    return res.status(400).json({ mensaje: "Faltan codevento o codsesion" });
+  }
+
+  try {
+    const [evento] = await sequelize.query(
+      `
+      SELECT e.estado, e.codusuario_en_vivo, e.codsesion_en_vivo, e.fecha_actividad_en_vivo,
+             pe.nombre AS nombre_usuario_en_vivo, pe.apodo AS apodo_usuario_en_vivo
+      FROM eventos e
+      LEFT JOIN personas pe ON pe.codpersona = e.codusuario_en_vivo
+      WHERE e.codevento = :codevento
+      `,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (!evento) {
+      return res.status(404).json({ mensaje: "Evento no encontrado" });
+    }
+
+    if (evento.estado === 'F' || evento.estado === 'B') {
+      return res.status(400).json({ mensaje: "El evento está finalizado o eliminado" });
+    }
+
+    const actividadMs = evento.fecha_actividad_en_vivo
+      ? new Date(evento.fecha_actividad_en_vivo).getTime()
+      : 0;
+    const vencido = !evento.codusuario_en_vivo || (Date.now() - actividadMs) > EN_VIVO_LOCK_TIMEOUT_MS;
+    const soyElUsuario = evento.codusuario_en_vivo === codpersona;
+    const esMiSesion = evento.codsesion_en_vivo === codsesion;
+
+    // Ocupado por otro usuario: nunca se puede forzar.
+    if (!vencido && !soyElUsuario) {
+      return res.status(409).json({
+        ok: false,
+        ocupado: true,
+        nombre_usuario_en_vivo: evento.apodo_usuario_en_vivo || evento.nombre_usuario_en_vivo || "otro usuario",
+      });
+    }
+
+    // Ocupado por vos mismo pero desde otra pestaña/dispositivo: se puede forzar el traspaso.
+    if (!vencido && soyElUsuario && !esMiSesion && !forzar) {
+      return res.status(409).json({
+        ok: false,
+        ocupado: true,
+        mismoUsuarioOtraSesion: true,
+        nombre_usuario_en_vivo: evento.apodo_usuario_en_vivo || evento.nombre_usuario_en_vivo || "vos",
+      });
+    }
+
+    await sequelize.query(
+      `UPDATE eventos SET codusuario_en_vivo = :codpersona, codsesion_en_vivo = :codsesion, fecha_actividad_en_vivo = NOW() WHERE codevento = :codevento`,
+      { replacements: { codpersona, codsesion, codevento } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Error en /evento_en_vivo_tomar:", error);
+    res.status(500).json({ mensaje: "Error interno del servidor" });
+  }
+});
+
+app.post("/evento_en_vivo_heartbeat", verificarToken, async (req, res) => {
+  const { codevento, codsesion } = req.body;
+  const codpersona = req.user.id;
+
+  if (!codevento || !codsesion) {
+    return res.status(400).json({ mensaje: "Faltan codevento o codsesion" });
+  }
+
+  try {
+    const [, updatedRows] = await sequelize.query(
+      `UPDATE eventos SET fecha_actividad_en_vivo = NOW()
+       WHERE codevento = :codevento AND codusuario_en_vivo = :codpersona AND codsesion_en_vivo = :codsesion`,
+      { replacements: { codevento, codpersona, codsesion }, type: sequelize.QueryTypes.UPDATE }
+    );
+
+    if (!updatedRows) {
+      const [actual] = await sequelize.query(
+        `
+        SELECT pe.nombre, pe.apodo, e.codusuario_en_vivo
+        FROM eventos e
+        LEFT JOIN personas pe ON pe.codpersona = e.codusuario_en_vivo
+        WHERE e.codevento = :codevento
+        `,
+        { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+      );
+      return res.status(409).json({
+        ok: false,
+        perdioControl: true,
+        mismoUsuarioOtraSesion: actual?.codusuario_en_vivo === codpersona,
+        nombre_usuario_en_vivo: actual?.apodo || actual?.nombre || null,
+      });
+    }
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Error en /evento_en_vivo_heartbeat:", error);
+    res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 });
 
@@ -2209,6 +2892,8 @@ app.post("/asociar_personas_division", verificarToken, async (req, res) => {
           }
         );
         insertadas.push(codpersona);
+
+        await agregarPersonaAEventosActivos(codpersona, coddivision, t);
       }
     }
 
@@ -2268,10 +2953,187 @@ app.post("/quitar_persona_division", verificarToken, async (req, res) => {
     
   } catch (error) {
     console.error("Error en quitar_persona_division:", error);
-    res.status(500).json({ 
+    res.status(500).json({
       error: "Error al quitar persona de la división",
-      detalle: error.message 
+      detalle: error.message
     });
+  }
+});
+
+
+// ===================================================
+// GRUPOS (personas de cualquier división agrupadas)
+// ===================================================
+
+app.post('/grupos_listar', verificarToken, async (req, res) => {
+  const { codclub } = req.body;
+
+  if (!codclub) {
+    return res.status(400).json({ mensaje: 'Falta codclub' });
+  }
+
+  try {
+    const rows = await sequelize.query(
+      `
+      SELECT
+        g.codgrupo,
+        g.descripcion,
+        (
+          SELECT COUNT(*)
+          FROM grupos_personas gp
+          WHERE gp.codgrupo = g.codgrupo AND gp.estado = 'A'
+        ) AS cantidad_personas
+      FROM grupos g
+      WHERE g.codclub = :codclub
+        AND g.estado = 'A'
+      ORDER BY g.descripcion
+      `,
+      { replacements: { codclub }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error('Error en /grupos_listar:', error);
+    res.status(500).json({ mensaje: 'Error interno', error: error.message });
+  }
+});
+
+app.post('/grupo_guardar', verificarToken, async (req, res) => {
+  const { codgrupo, codclub, descripcion } = req.body;
+
+  if (!codclub || !descripcion) {
+    return res.status(400).json({ mensaje: 'Faltan codclub o descripcion' });
+  }
+
+  try {
+    if (codgrupo) {
+      await sequelize.query(
+        `UPDATE grupos SET descripcion = :descripcion WHERE codgrupo = :codgrupo AND codclub = :codclub`,
+        { replacements: { codgrupo, codclub, descripcion } }
+      );
+      return res.json({ ok: true, codgrupo });
+    }
+
+    const [result] = await sequelize.query(
+      `INSERT INTO grupos (codclub, descripcion, estado) VALUES (:codclub, :descripcion, 'A')`,
+      { replacements: { codclub, descripcion }, type: sequelize.QueryTypes.INSERT }
+    );
+
+    res.json({ ok: true, codgrupo: result });
+  } catch (error) {
+    console.error('Error en /grupo_guardar:', error);
+    res.status(500).json({ mensaje: 'Error interno', error: error.message });
+  }
+});
+
+app.post('/grupo_eliminar', verificarToken, async (req, res) => {
+  const { codgrupo } = req.body;
+
+  if (!codgrupo) {
+    return res.status(400).json({ mensaje: 'Falta codgrupo' });
+  }
+
+  try {
+    await sequelize.query(
+      `UPDATE grupos SET estado = 'B' WHERE codgrupo = :codgrupo`,
+      { replacements: { codgrupo } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en /grupo_eliminar:', error);
+    res.status(500).json({ mensaje: 'Error interno', error: error.message });
+  }
+});
+
+app.post('/grupo_personas_listar', verificarToken, async (req, res) => {
+  const { codgrupo } = req.body;
+
+  if (!codgrupo) {
+    return res.status(400).json({ mensaje: 'Falta codgrupo' });
+  }
+
+  try {
+    const rows = await sequelize.query(
+      `
+      SELECT
+          p.codpersona,
+          p.nombre,
+          p.apodo,
+          (
+            SELECT JSON_ARRAYAGG(
+              JSON_OBJECT('coddivision', d.coddivision, 'descripcion', d.descripcion)
+            )
+            FROM personas_divisiones pd
+            INNER JOIN divisiones d ON d.coddivision = pd.coddivision
+            WHERE pd.codpersona = p.codpersona
+          ) AS divisiones
+      FROM grupos_personas gp
+      INNER JOIN personas p ON p.codpersona = gp.codpersona
+      WHERE gp.codgrupo = :codgrupo
+        AND gp.estado = 'A'
+        AND p.estado <> 6
+      ORDER BY p.nombre
+      `,
+      { replacements: { codgrupo }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error('Error en /grupo_personas_listar:', error);
+    res.status(500).json({ mensaje: 'Error interno', error: error.message });
+  }
+});
+
+app.post('/grupo_persona_agregar', verificarToken, async (req, res) => {
+  const { codgrupo, codpersona } = req.body;
+
+  if (!codgrupo || !codpersona) {
+    return res.status(400).json({ mensaje: 'Faltan codgrupo o codpersona' });
+  }
+
+  try {
+    const existe = await sequelize.query(
+      `SELECT 1 FROM grupos_personas WHERE codgrupo = :codgrupo AND codpersona = :codpersona`,
+      { replacements: { codgrupo, codpersona }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (existe.length > 0) {
+      await sequelize.query(
+        `UPDATE grupos_personas SET estado = 'A' WHERE codgrupo = :codgrupo AND codpersona = :codpersona`,
+        { replacements: { codgrupo, codpersona } }
+      );
+    } else {
+      await sequelize.query(
+        `INSERT INTO grupos_personas (codgrupo, codpersona, estado) VALUES (:codgrupo, :codpersona, 'A')`,
+        { replacements: { codgrupo, codpersona } }
+      );
+    }
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en /grupo_persona_agregar:', error);
+    res.status(500).json({ mensaje: 'Error interno', error: error.message });
+  }
+});
+
+app.post('/grupo_persona_quitar', verificarToken, async (req, res) => {
+  const { codgrupo, codpersona } = req.body;
+
+  if (!codgrupo || !codpersona) {
+    return res.status(400).json({ mensaje: 'Faltan codgrupo o codpersona' });
+  }
+
+  try {
+    await sequelize.query(
+      `DELETE FROM grupos_personas WHERE codgrupo = :codgrupo AND codpersona = :codpersona`,
+      { replacements: { codgrupo, codpersona } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en /grupo_persona_quitar:', error);
+    res.status(500).json({ mensaje: 'Error interno', error: error.message });
   }
 });
 
@@ -2385,6 +3247,19 @@ app.post("/eventos_detalles", verificarToken, async (req, res) => {
     const tieneDivisiones =
       Array.isArray(coddivisiones) && coddivisiones.length > 0;
 
+    // Filtrar por una división (ej. M14) debe traer también los eventos armados
+    // para sus sub-divisiones (M14-A, M14-B), no solo coincidencias exactas.
+    let coddivisionesFiltro = coddivisiones;
+    if (tieneDivisiones) {
+      const hijos = await sequelize.query(
+        `SELECT coddivision FROM divisiones WHERE coddivision_padre IN (:coddivisiones)`,
+        { replacements: { coddivisiones }, type: sequelize.QueryTypes.SELECT }
+      );
+      coddivisionesFiltro = [
+        ...new Set([...coddivisiones, ...hijos.map((h) => h.coddivision)]),
+      ];
+    }
+
     const strsql = `
 SELECT
   e.codevento,
@@ -2393,6 +3268,9 @@ SELECT
   e.sub_tipo,
   e.observacion,
   e.estado,
+  e.codclub_rival,
+  cr.descripcion AS rival_descripcion,
+  cr.escudo AS rival_escudo,
 
   (
     SELECT JSON_ARRAYAGG(
@@ -2402,10 +3280,15 @@ SELECT
       )
     )
     FROM (
-      SELECT d.coddivision, d.descripcion
+      SELECT d.coddivision,
+        CASE WHEN dp.descripcion IS NOT NULL
+             THEN CONCAT(dp.descripcion, ' ', d.descripcion)
+             ELSE d.descripcion END AS descripcion
       FROM det_evento_division ded
       INNER JOIN divisiones d
         ON d.coddivision = ded.coddivision
+      LEFT JOIN divisiones dp
+        ON dp.coddivision = d.coddivision_padre
       WHERE ded.codevento = e.codevento
       ORDER BY d.descripcion
     ) x
@@ -2455,10 +3338,12 @@ INNER JOIN det_evento_division dedf
   ON dedf.codevento = e.codevento
 INNER JOIN divisiones df
   ON df.coddivision = dedf.coddivision
+LEFT JOIN clubes cr
+  ON cr.codclub = e.codclub_rival
 
 WHERE e.estado <> 'B'
   AND df.codclub = :codclub
-  ${tieneDivisiones ? "AND dedf.coddivision IN (:coddivisiones)" : ""}
+  ${tieneDivisiones ? "AND dedf.coddivision IN (:coddivisionesFiltro)" : ""}
   ${fecha_desde && fecha_hasta ? "AND e.fecha BETWEEN :fecha_desde AND :fecha_hasta" : ""}
 
 GROUP BY e.codevento
@@ -2471,7 +3356,7 @@ ORDER BY e.fecha DESC
     const eventos = await sequelize.query(strsql, {
       replacements: {
         codclub,
-        coddivisiones,
+        coddivisionesFiltro,
         fecha_desde,
         fecha_hasta
       },
@@ -2506,9 +3391,13 @@ app.post("/evento_estado", verificarToken, async (req, res) => {
   }
 
   try {
+    // Al finalizar/cancelar/dar de baja un evento, liberamos el control en vivo
+    // (si estaba tomado) para no dejar el candado colgado.
+    const liberaEnVivo = ['F', 'C', 'B'].includes(tipo);
+
     // Ejecutar el update
     const [updatedRows] = await sequelize.query(
-      `UPDATE eventos SET estado = :tipo WHERE codevento = :codevento`,
+      `UPDATE eventos SET estado = :tipo${liberaEnVivo ? ", codusuario_en_vivo = NULL, fecha_actividad_en_vivo = NULL" : ""} WHERE codevento = :codevento`,
       {
         replacements: { codevento, tipo },
         type: sequelize.QueryTypes.UPDATE
@@ -2580,6 +3469,356 @@ app.post('/actividades_club', verificarToken, async (req, res) => {
     res.json(rows);
   } catch (error) {
     console.error(error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+//===========SUCESOS (partido) ====================================
+
+// ENDPOINT: Listar sucesos de una disciplina (catálogo, ej: Scrum, Line, Try)
+// soloActivos=false (uso admin) devuelve también los dados de baja
+app.post('/sucesos_disciplina', verificarToken, async (req, res) => {
+  const { coddisciplina, soloActivos } = req.body;
+
+  if (!coddisciplina)
+    return res.status(400).json({ mensaje: 'Falta coddisciplina' });
+
+  try {
+    const rows = await sequelize.query(
+      `
+      SELECT codsuceso, descripcion, puntos, estado, lleva_resultado, lleva_jugador, es_cambio,
+             expulsa, dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, label_positivo, label_negativo,
+             motivo_positivo, motivo_negativo, motivo_dispara_codsuceso
+      FROM sucesos
+      WHERE coddisciplina = :coddisciplina
+        ${soloActivos === false ? '' : "AND estado = 'A'"}
+      ORDER BY descripcion
+      `,
+      {
+        replacements: { coddisciplina },
+        type: sequelize.QueryTypes.SELECT
+      }
+    );
+
+    res.json(rows);
+  } catch (error) {
+    console.error('Error en /sucesos_disciplina:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ENDPOINT: Crear un suceso en el catálogo de una disciplina
+app.post('/suceso_crear', verificarToken, async (req, res) => {
+  const {
+    coddisciplina, descripcion, puntos, lleva_resultado, lleva_jugador, es_cambio, expulsa,
+    dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, label_positivo, label_negativo,
+    motivo_positivo, motivo_negativo, motivo_dispara_codsuceso
+  } = req.body;
+
+  if (!coddisciplina || !descripcion)
+    return res.status(400).json({ mensaje: 'Faltan datos (coddisciplina, descripcion)' });
+
+  try {
+    await sequelize.query(
+      `
+      INSERT INTO sucesos (
+        coddisciplina, descripcion, puntos, estado, lleva_resultado, lleva_jugador, es_cambio, expulsa,
+        dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, label_positivo, label_negativo,
+        motivo_positivo, motivo_negativo, motivo_dispara_codsuceso
+      )
+      VALUES (
+        :coddisciplina, :descripcion, :puntos, 'A', :lleva_resultado, :lleva_jugador, :es_cambio, :expulsa,
+        :dispara_codsuceso, :variante_de_codsuceso, :puntos_condicionados, :label_positivo, :label_negativo,
+        :motivo_positivo, :motivo_negativo, :motivo_dispara_codsuceso
+      )
+      `,
+      {
+        replacements: {
+          coddisciplina,
+          descripcion,
+          puntos: puntos || 0,
+          lleva_resultado: lleva_resultado === 'N' ? 'N' : 'S',
+          lleva_jugador: lleva_jugador === 'N' ? 'N' : 'S',
+          es_cambio: es_cambio === 'S' ? 'S' : 'N',
+          expulsa: expulsa === 'S' ? 'S' : 'N',
+          dispara_codsuceso: dispara_codsuceso || null,
+          variante_de_codsuceso: variante_de_codsuceso || null,
+          puntos_condicionados: puntos_condicionados === 'S' ? 'S' : 'N',
+          label_positivo: label_positivo || null,
+          label_negativo: label_negativo || null,
+          motivo_positivo: motivo_positivo || null,
+          motivo_negativo: motivo_negativo || null,
+          motivo_dispara_codsuceso: motivo_dispara_codsuceso || null
+        }
+      }
+    );
+
+    const [[{ codsuceso }]] = await sequelize.query(`SELECT LAST_INSERT_ID() AS codsuceso`);
+
+    res.json({ ok: true, codsuceso });
+  } catch (error) {
+    console.error('Error en /suceso_crear:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ENDPOINT: Editar un suceso del catálogo (descripción, puntos, estado, flags)
+app.post('/suceso_editar', verificarToken, async (req, res) => {
+  const {
+    codsuceso, descripcion, puntos, estado, lleva_resultado, lleva_jugador, es_cambio, expulsa,
+    dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, label_positivo, label_negativo,
+    motivo_positivo, motivo_negativo, motivo_dispara_codsuceso
+  } = req.body;
+
+  if (!codsuceso)
+    return res.status(400).json({ mensaje: 'Falta codsuceso' });
+
+  try {
+    await sequelize.query(
+      `
+      UPDATE sucesos
+      SET descripcion = COALESCE(:descripcion, descripcion),
+          puntos = COALESCE(:puntos, puntos),
+          estado = COALESCE(:estado, estado),
+          lleva_resultado = COALESCE(:lleva_resultado, lleva_resultado),
+          lleva_jugador = COALESCE(:lleva_jugador, lleva_jugador),
+          es_cambio = COALESCE(:es_cambio, es_cambio),
+          expulsa = COALESCE(:expulsa, expulsa),
+          puntos_condicionados = COALESCE(:puntos_condicionados, puntos_condicionados),
+          dispara_codsuceso = :dispara_codsuceso,
+          variante_de_codsuceso = :variante_de_codsuceso,
+          label_positivo = :label_positivo,
+          label_negativo = :label_negativo,
+          motivo_positivo = :motivo_positivo,
+          motivo_negativo = :motivo_negativo,
+          motivo_dispara_codsuceso = :motivo_dispara_codsuceso
+      WHERE codsuceso = :codsuceso
+      `,
+      {
+        replacements: {
+          codsuceso,
+          descripcion: descripcion ?? null,
+          puntos: puntos ?? null,
+          estado: estado ?? null,
+          lleva_resultado: lleva_resultado ?? null,
+          lleva_jugador: lleva_jugador ?? null,
+          es_cambio: es_cambio ?? null,
+          expulsa: expulsa ?? null,
+          puntos_condicionados: puntos_condicionados ?? null,
+          dispara_codsuceso: dispara_codsuceso || null,
+          variante_de_codsuceso: variante_de_codsuceso || null,
+          label_positivo: label_positivo || null,
+          label_negativo: label_negativo || null,
+          motivo_positivo: motivo_positivo || null,
+          motivo_negativo: motivo_negativo || null,
+          motivo_dispara_codsuceso: motivo_dispara_codsuceso || null
+        }
+      }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en /suceso_editar:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ENDPOINT: Registrar una ocurrencia de un suceso durante un evento (partido)
+app.post('/evento_suceso_registrar', verificarToken, async (req, res) => {
+  const { codevento, codsuceso, minuto, segundo, resultado, codpersona, codpersona_entra, observacion, equipo } = req.body;
+
+  if (!codevento || !codsuceso || minuto === undefined || segundo === undefined)
+    return res.status(400).json({ mensaje: 'Faltan datos (codevento, codsuceso, minuto, segundo)' });
+
+  if (resultado && !['G', 'P'].includes(resultado))
+    return res.status(400).json({ mensaje: 'Resultado inválido' });
+
+  if (equipo && !['N', 'R'].includes(equipo))
+    return res.status(400).json({ mensaje: 'Equipo inválido' });
+
+  try {
+    const [evento] = await sequelize.query(
+      `SELECT estado FROM eventos WHERE codevento = :codevento`,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (!evento)
+      return res.status(404).json({ mensaje: 'Evento no encontrado' });
+
+    if (evento.estado === 'F' || evento.estado === 'B')
+      return res.status(400).json({ mensaje: 'No se puede registrar sucesos en un evento finalizado o eliminado' });
+
+    await sequelize.query(
+      `
+      INSERT INTO det_evento_suceso (codevento, codsuceso, codpersona, codpersona_entra, minuto, segundo, resultado, observacion, equipo)
+      VALUES (:codevento, :codsuceso, :codpersona, :codpersona_entra, :minuto, :segundo, :resultado, :observacion, :equipo)
+      `,
+      {
+        replacements: {
+          codevento,
+          codsuceso,
+          codpersona: codpersona || null,
+          codpersona_entra: codpersona_entra || null,
+          minuto,
+          segundo,
+          resultado: resultado || null,
+          observacion: observacion || null,
+          equipo: equipo === 'R' ? 'R' : 'N'
+        }
+      }
+    );
+
+    const [[{ codeventosuceso }]] = await sequelize.query(`SELECT LAST_INSERT_ID() AS codeventosuceso`);
+
+    res.json({ ok: true, codeventosuceso });
+  } catch (error) {
+    console.error('Error en /evento_suceso_registrar:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ENDPOINT: Listar los sucesos registrados de un evento + resultado (suma de puntos)
+app.post('/evento_sucesos', verificarToken, async (req, res) => {
+  const { codevento } = req.body;
+
+  if (!codevento)
+    return res.status(400).json({ mensaje: 'Falta codevento' });
+
+  try {
+    const sucesos = await sequelize.query(
+      `
+      SELECT
+        des.codeventosuceso,
+        des.codsuceso,
+        s.descripcion,
+        s.puntos,
+        s.puntos_condicionados,
+        s.lleva_resultado,
+        s.lleva_jugador,
+        s.es_cambio,
+        s.expulsa,
+        s.label_positivo,
+        s.label_negativo,
+        des.codpersona,
+        p.nombre AS persona,
+        des.codpersona_entra,
+        pe.nombre AS persona_entra,
+        des.minuto,
+        des.segundo,
+        des.resultado,
+        des.observacion,
+        des.fecha_registro,
+        des.equipo
+      FROM det_evento_suceso des
+      INNER JOIN sucesos s ON s.codsuceso = des.codsuceso
+      LEFT JOIN personas p ON p.codpersona = des.codpersona
+      LEFT JOIN personas pe ON pe.codpersona = des.codpersona_entra
+      WHERE des.codevento = :codevento
+      ORDER BY des.minuto DESC, des.segundo DESC, des.codeventosuceso DESC
+      `,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    const [{ resultado, resultado_rival_sucesos }] = await sequelize.query(
+      `
+      SELECT
+        COALESCE(SUM(CASE WHEN des.equipo = 'R' THEN 0 ELSE
+          CASE
+            WHEN s.puntos_condicionados = 'S' THEN (CASE WHEN des.resultado = 'G' THEN s.puntos ELSE 0 END)
+            ELSE s.puntos
+          END
+        END), 0) AS resultado,
+        COALESCE(SUM(CASE WHEN des.equipo = 'R' THEN
+          CASE
+            WHEN s.puntos_condicionados = 'S' THEN (CASE WHEN des.resultado = 'G' THEN s.puntos ELSE 0 END)
+            ELSE s.puntos
+          END
+        ELSE 0 END), 0) AS resultado_rival_sucesos
+      FROM det_evento_suceso des
+      INNER JOIN sucesos s ON s.codsuceso = des.codsuceso
+      WHERE des.codevento = :codevento
+      `,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    res.json({ sucesos, resultado, resultadoRivalSucesos: resultado_rival_sucesos });
+  } catch (error) {
+    console.error('Error en /evento_sucesos:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ENDPOINT: Reiniciar un partido: borra todos los sucesos registrados (y por
+// lo tanto, los minutos jugados que se calculan a partir de ellos)
+app.post('/evento_sucesos_reiniciar', verificarToken, async (req, res) => {
+  const { codevento } = req.body;
+
+  if (!codevento)
+    return res.status(400).json({ mensaje: 'Falta codevento' });
+
+  try {
+    const [evento] = await sequelize.query(
+      `SELECT estado FROM eventos WHERE codevento = :codevento`,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (!evento)
+      return res.status(404).json({ mensaje: 'Evento no encontrado' });
+
+    if (evento.estado === 'F' || evento.estado === 'B')
+      return res.status(400).json({ mensaje: 'No se puede reiniciar un evento finalizado o eliminado' });
+
+    await sequelize.query(
+      `DELETE FROM det_evento_suceso WHERE codevento = :codevento`,
+      { replacements: { codevento } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en /evento_sucesos_reiniciar:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ENDPOINT: Definir el resultado (Ganó/Perdió/Sin resultado) de un suceso ya registrado
+app.post('/evento_suceso_resultado', verificarToken, async (req, res) => {
+  const { codeventosuceso, resultado, observacion } = req.body;
+
+  if (!codeventosuceso)
+    return res.status(400).json({ mensaje: 'Falta codeventosuceso' });
+
+  if (resultado && !['G', 'P'].includes(resultado))
+    return res.status(400).json({ mensaje: 'Resultado inválido' });
+
+  try {
+    await sequelize.query(
+      `UPDATE det_evento_suceso SET resultado = :resultado, observacion = :observacion WHERE codeventosuceso = :codeventosuceso`,
+      { replacements: { codeventosuceso, resultado: resultado || null, observacion: observacion || null } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en /evento_suceso_resultado:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ENDPOINT: Eliminar un suceso registrado por error
+app.post('/evento_suceso_eliminar', verificarToken, async (req, res) => {
+  const { codeventosuceso } = req.body;
+
+  if (!codeventosuceso)
+    return res.status(400).json({ mensaje: 'Falta codeventosuceso' });
+
+  try {
+    await sequelize.query(
+      `DELETE FROM det_evento_suceso WHERE codeventosuceso = :codeventosuceso`,
+      { replacements: { codeventosuceso } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Error en /evento_suceso_eliminar:', error);
     res.status(500).json({ mensaje: 'Error interno' });
   }
 });
