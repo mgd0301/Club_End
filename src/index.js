@@ -2627,10 +2627,10 @@ app.post("/evento_convocatoria", verificarToken, async (req, res) => {
 
     const jugadores = await sequelize.query(
       `
-      SELECT j.codpersona, j.nombre, j.apodo, j.convocatoria, j.coddivision,
+      SELECT j.codpersona, j.nombre, j.apodo, j.convocatoria, j.orden, j.coddivision,
              dv.descripcion AS division_descripcion
       FROM (
-        SELECT de.codpersona, p.nombre, p.apodo, de.convocatoria,
+        SELECT de.codpersona, p.nombre, p.apodo, de.convocatoria, de.orden,
           (
             SELECT pd.coddivision FROM personas_divisiones pd
             WHERE pd.codpersona = de.codpersona
@@ -2649,7 +2649,7 @@ app.post("/evento_convocatoria", verificarToken, async (req, res) => {
           )
       ) j
       LEFT JOIN divisiones dv ON dv.coddivision = j.coddivision
-      ORDER BY j.apodo, j.nombre
+      ORDER BY CASE WHEN j.orden IS NULL THEN 1 ELSE 0 END, j.orden, j.apodo, j.nombre
       `,
       {
         replacements: { codevento, familiaPool, idsSeleccionados },
@@ -2668,7 +2668,7 @@ app.post("/evento_convocatoria", verificarToken, async (req, res) => {
 // ENDPOINT: Guardar convocatoria de un jugador (titular/suplente/no citado)
 // ============================================
 app.post("/evento_convocatoria_actualizar", verificarToken, async (req, res) => {
-  const { codevento, codpersona, convocatoria } = req.body;
+  const { codevento, codpersona, convocatoria, orden } = req.body;
 
   if (!codevento || !codpersona) {
     return res.status(400).json({ mensaje: "Faltan parámetros" });
@@ -2692,14 +2692,18 @@ app.post("/evento_convocatoria_actualizar", verificarToken, async (req, res) => 
       return res.status(400).json({ mensaje: "No se puede editar la convocatoria de un evento finalizado o eliminado" });
     }
 
+    // El orden sólo tiene sentido para titulares/suplentes; al sacar a alguien
+    // (convocatoria null/N) se resetea para que no quede un número viejo.
+    const ordenFinal = (convocatoria === 'T' || convocatoria === 'S') ? (orden ?? null) : null;
+
     await sequelize.query(
       `
       UPDATE det_evento
-      SET convocatoria = :convocatoria
+      SET convocatoria = :convocatoria, orden = :orden
       WHERE codevento = :codevento
         AND codpersona = :codpersona
       `,
-      { replacements: { codevento, codpersona, convocatoria } }
+      { replacements: { codevento, codpersona, convocatoria, orden: ordenFinal } }
     );
 
     res.json({ ok: true });
