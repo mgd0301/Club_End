@@ -295,6 +295,38 @@ app.post('/disciplinas_todas', verificarToken, async (req, res) => {
 });
 
 // ===================================================
+// CLUBES: alta de un club nuevo
+// ===================================================
+app.post('/club_crear', verificarToken, async (req, res) => {
+  const { descripcion } = req.body;
+
+  if (!descripcion || !descripcion.trim())
+    return res.status(400).json({ mensaje: 'Falta descripcion' });
+
+  try {
+    const existente = await sequelize.query(
+      `SELECT codclub FROM clubes WHERE descripcion = :descripcion AND estado <> 'B'`,
+      { replacements: { descripcion: descripcion.trim() }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (existente.length > 0)
+      return res.status(400).json({ mensaje: 'Ya existe un club con ese nombre', codclub_existente: existente[0].codclub });
+
+    await sequelize.query(
+      `INSERT INTO clubes (descripcion, estado) VALUES (:descripcion, 'A')`,
+      { replacements: { descripcion: descripcion.trim() } }
+    );
+
+    const [[{ codclub }]] = await sequelize.query(`SELECT LAST_INSERT_ID() AS codclub`);
+
+    res.json({ ok: true, codclub });
+  } catch (error) {
+    console.error('Error en /club_crear:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+// ===================================================
 // CLUBES: listado para administración (con sus disciplinas)
 // ===================================================
 app.post('/clubes_admin', verificarToken, async (req, res) => {
@@ -636,6 +668,32 @@ app.post('/roles_por_club', verificarToken, async (req, res) => {
     res.json(roles);
   } catch (error) {
     console.error("Error en /roles_por_club:", error);
+    res.status(500).json({ mensaje: 'Error interno del servidor' });
+  }
+});
+
+// ============================================
+// ENDPOINT: Catálogo de posiciones de cancha de una disciplina (ej: rugby ->
+// Pilar Izquierdo..Full Back; fútbol -> Arquero/Defensor/Mediocampista/Delantero)
+// ============================================
+app.post('/posiciones_por_disciplina', verificarToken, async (req, res) => {
+  const { coddisciplina } = req.body;
+
+  try {
+    const posiciones = await sequelize.query(
+      `SELECT codposicion, descripcion
+       FROM posiciones
+       WHERE coddisciplina = :coddisciplina
+       ORDER BY orden`,
+      {
+        replacements: { coddisciplina },
+        type: sequelize.QueryTypes.SELECT
+      }
+    );
+
+    res.json(posiciones);
+  } catch (error) {
+    console.error("Error en /posiciones_por_disciplina:", error);
     res.status(500).json({ mensaje: 'Error interno del servidor' });
   }
 });
@@ -1029,71 +1087,44 @@ app.post('/persona_guardar', verificarToken, async (req, res) => {
       // ==========================
       // EDITAR PERSONA
       // ==========================
+      // Solo se actualizan los campos que vinieron en el body: así un llamado
+      // parcial (ej: asociar una persona existente a un club nuevo, que solo
+      // manda codpersona/nombre/codclub) no pisa con null el resto de sus datos
+      // (usuario, email, clave, etc.) que no se enviaron.
 
-      if (clave) {
+      const camposEditables = {
+        nombre, apodo, dni, fecha_nacimiento, telefono, email, usuario, activo, estado
+      };
+      if (clave) camposEditables.clave = clave;
 
+      const camposValorNulleable = new Set(['apodo', 'dni', 'fecha_nacimiento', 'telefono', 'email', 'usuario']);
+      const camposConDefault1 = new Set(['activo', 'estado']);
+
+      const sets = [];
+      const valores = [];
+
+      for (const [campo, valor] of Object.entries(camposEditables)) {
+        if (valor === undefined) continue; // no se envió: no tocar este campo
+        sets.push(`${campo}=?`);
+        if (campo === 'clave') {
+          valores.push(valor);
+        } else if (camposConDefault1.has(campo)) {
+          valores.push(valor ?? 1);
+        } else if (camposValorNulleable.has(campo)) {
+          valores.push(valor || null);
+        } else {
+          valores.push(valor);
+        }
+      }
+
+      if (sets.length > 0) {
         await sequelize.query(
-          `UPDATE personas
-           SET nombre=?,
-               apodo=?,
-               dni=?,
-               fecha_nacimiento=?,
-               telefono=?,
-               email=?,
-               usuario=?,
-               clave=?,
-               activo=?,
-               estado=?
-           WHERE codpersona=?`,
+          `UPDATE personas SET ${sets.join(', ')} WHERE codpersona=?`,
           {
-            replacements: [
-              nombre,
-              apodo || null,
-              dni || null,
-              fecha_nacimiento || null,
-              telefono || null,
-              email || null,
-              usuario || null,
-              clave,
-              activo ?? 1,
-              estado ?? 1,
-              codpersonaSafe
-            ],
+            replacements: [...valores, codpersonaSafe],
             transaction: t
           }
         );
-
-      } else {
-
-        await sequelize.query(
-          `UPDATE personas
-           SET nombre=?,
-               apodo=?,
-               dni=?,
-               fecha_nacimiento=?,
-               telefono=?,
-               email=?,
-               usuario=?,
-               activo=?,
-               estado=?
-           WHERE codpersona=?`,
-          {
-            replacements: [
-              nombre,
-              apodo || null,
-              dni || null,
-              fecha_nacimiento || null,
-              telefono || null,
-              email || null,
-              usuario || null,
-              activo ?? 1,
-              estado ?? 1,
-              codpersonaSafe
-            ],
-            transaction: t
-          }
-        );
-
       }
 
     }
@@ -1130,12 +1161,15 @@ app.post('/persona_guardar', verificarToken, async (req, res) => {
     // ==========================
     // DIVISIONES
     // ==========================
+    // Solo se reemplazan las divisiones del club+disciplina actual: así no se
+    // pierden las asociaciones que la persona ya tenga en otros clubes/disciplinas.
 
     await sequelize.query(
-      `DELETE FROM personas_divisiones
-       WHERE codpersona = ?`,
+      `DELETE pd FROM personas_divisiones pd
+       INNER JOIN divisiones d ON d.coddivision = pd.coddivision
+       WHERE pd.codpersona = ? AND d.codclub = ? AND d.coddisciplina = ?`,
       {
-        replacements: [personaId],
+        replacements: [personaId, codclub, coddisciplina || null],
         transaction: t
       }
     );
@@ -1183,7 +1217,52 @@ app.post('/persona_guardar', verificarToken, async (req, res) => {
   }
 
 });
-app.post('/personas_club', verificarToken, async (req, res) => { 
+
+// ENDPOINT: Buscar personas existentes (por DNI o nombre) en TODA la base,
+// sin importar el club/disciplina actual. Pensado para evitar altas
+// duplicadas cuando una persona ya existe en otro club/disciplina.
+app.post('/personas_buscar', verificarToken, async (req, res) => {
+  const { filtro } = req.body;
+
+  if (!filtro || filtro.trim().length < 2) {
+    return res.json([]);
+  }
+
+  try {
+    const personas = await sequelize.query(
+      `
+      SELECT
+        p.codpersona,
+        p.nombre,
+        p.apodo,
+        p.dni,
+        (
+          SELECT JSON_ARRAYAGG(
+            JSON_OBJECT('club', c.descripcion, 'disciplina', dis.descripcion, 'division', d.descripcion)
+          )
+          FROM personas_divisiones pd
+          INNER JOIN divisiones d ON d.coddivision = pd.coddivision
+          INNER JOIN clubes c ON c.codclub = d.codclub
+          LEFT JOIN disciplinas dis ON dis.coddisciplina = d.coddisciplina
+          WHERE pd.codpersona = p.codpersona
+        ) AS pertenece_a
+      FROM personas p
+      WHERE p.estado <> 6
+        AND (p.dni LIKE :filtro OR p.nombre LIKE :filtro)
+      ORDER BY p.nombre
+      LIMIT 15
+      `,
+      { replacements: { filtro: `%${filtro}%` }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    res.json(personas);
+  } catch (error) {
+    console.error('Error en /personas_buscar:', error);
+    res.status(500).json({ mensaje: 'Error interno' });
+  }
+});
+
+app.post('/personas_club', verificarToken, async (req, res) => {
   const { codclub, coddisciplina, filtro, soloSinDivision, soloJugadores } = req.body; // 👈 Agregamos soloSinDivision
 
   if (!codclub) {
@@ -2547,7 +2626,7 @@ app.post("/evento_convocatoria", verificarToken, async (req, res) => {
   try {
     const [evento] = await sequelize.query(
       `
-      SELECT e.codevento, e.tipo, e.fecha, e.estado, e.coddisciplina, d.cant_titulares, d.cant_suplentes,
+      SELECT e.codevento, e.tipo, e.fecha, e.estado, e.coddisciplina, e.formacion, d.cant_titulares, d.cant_suplentes,
              e.codclub, cp.descripcion AS club_descripcion, cp.escudo AS club_escudo,
              e.codclub_rival, cr.descripcion AS rival_descripcion, cr.escudo AS rival_escudo,
              e.resultado_rival,
@@ -2628,9 +2707,9 @@ app.post("/evento_convocatoria", verificarToken, async (req, res) => {
     const jugadores = await sequelize.query(
       `
       SELECT j.codpersona, j.nombre, j.apodo, j.convocatoria, j.orden, j.coddivision,
-             dv.descripcion AS division_descripcion
+             dv.descripcion AS division_descripcion, j.codposicion, pos.descripcion AS posicion_descripcion
       FROM (
-        SELECT de.codpersona, p.nombre, p.apodo, de.convocatoria, de.orden,
+        SELECT de.codpersona, p.nombre, p.apodo, de.convocatoria, de.orden, de.codposicion,
           (
             SELECT pd.coddivision FROM personas_divisiones pd
             WHERE pd.codpersona = de.codpersona
@@ -2649,6 +2728,7 @@ app.post("/evento_convocatoria", verificarToken, async (req, res) => {
           )
       ) j
       LEFT JOIN divisiones dv ON dv.coddivision = j.coddivision
+      LEFT JOIN posiciones pos ON pos.codposicion = j.codposicion
       ORDER BY CASE WHEN j.orden IS NULL THEN 1 ELSE 0 END, j.orden, j.apodo, j.nombre
       `,
       {
@@ -2709,6 +2789,83 @@ app.post("/evento_convocatoria_actualizar", verificarToken, async (req, res) => 
     res.json({ ok: true });
   } catch (error) {
     console.error("Error en /evento_convocatoria_actualizar:", error);
+    res.status(500).json({ mensaje: "Error interno del servidor" });
+  }
+});
+
+// ============================================
+// ENDPOINT: Guardar la posición de cancha de un jugador en un evento
+// ============================================
+app.post("/evento_posicion_actualizar", verificarToken, async (req, res) => {
+  const { codevento, codpersona, codposicion } = req.body;
+
+  if (!codevento || !codpersona) {
+    return res.status(400).json({ mensaje: "Faltan parámetros" });
+  }
+
+  try {
+    const [evento] = await sequelize.query(
+      `SELECT estado FROM eventos WHERE codevento = :codevento`,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (!evento) {
+      return res.status(404).json({ mensaje: "Evento no encontrado" });
+    }
+
+    if (evento.estado === 'F' || evento.estado === 'B') {
+      return res.status(400).json({ mensaje: "No se puede editar la posición de un evento finalizado o eliminado" });
+    }
+
+    await sequelize.query(
+      `
+      UPDATE det_evento
+      SET codposicion = :codposicion
+      WHERE codevento = :codevento
+        AND codpersona = :codpersona
+      `,
+      { replacements: { codevento, codpersona, codposicion: codposicion ?? null } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Error en /evento_posicion_actualizar:", error);
+    res.status(500).json({ mensaje: "Error interno del servidor" });
+  }
+});
+
+// ============================================
+// ENDPOINT: Guardar la formación táctica de un evento (ej: fútbol "4-3-3")
+// ============================================
+app.post("/evento_formacion_actualizar", verificarToken, async (req, res) => {
+  const { codevento, formacion } = req.body;
+
+  if (!codevento) {
+    return res.status(400).json({ mensaje: "Falta codevento" });
+  }
+
+  try {
+    const [evento] = await sequelize.query(
+      `SELECT estado FROM eventos WHERE codevento = :codevento`,
+      { replacements: { codevento }, type: sequelize.QueryTypes.SELECT }
+    );
+
+    if (!evento) {
+      return res.status(404).json({ mensaje: "Evento no encontrado" });
+    }
+
+    if (evento.estado === 'F' || evento.estado === 'B') {
+      return res.status(400).json({ mensaje: "No se puede editar la formación de un evento finalizado o eliminado" });
+    }
+
+    await sequelize.query(
+      `UPDATE eventos SET formacion = :formacion WHERE codevento = :codevento`,
+      { replacements: { codevento, formacion: formacion || null } }
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    console.error("Error en /evento_formacion_actualizar:", error);
     res.status(500).json({ mensaje: "Error interno del servidor" });
   }
 });
@@ -3526,7 +3683,7 @@ app.post('/sucesos_disciplina', verificarToken, async (req, res) => {
     const rows = await sequelize.query(
       `
       SELECT codsuceso, descripcion, puntos, estado, lleva_resultado, lleva_jugador, es_cambio,
-             expulsa, dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, label_positivo, label_negativo,
+             expulsa, dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, invierte_equipo, label_positivo, label_negativo,
              motivo_positivo, motivo_negativo, motivo_dispara_codsuceso
       FROM sucesos
       WHERE coddisciplina = :coddisciplina
@@ -3550,7 +3707,7 @@ app.post('/sucesos_disciplina', verificarToken, async (req, res) => {
 app.post('/suceso_crear', verificarToken, async (req, res) => {
   const {
     coddisciplina, descripcion, puntos, lleva_resultado, lleva_jugador, es_cambio, expulsa,
-    dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, label_positivo, label_negativo,
+    dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, invierte_equipo, label_positivo, label_negativo,
     motivo_positivo, motivo_negativo, motivo_dispara_codsuceso
   } = req.body;
 
@@ -3562,12 +3719,12 @@ app.post('/suceso_crear', verificarToken, async (req, res) => {
       `
       INSERT INTO sucesos (
         coddisciplina, descripcion, puntos, estado, lleva_resultado, lleva_jugador, es_cambio, expulsa,
-        dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, label_positivo, label_negativo,
+        dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, invierte_equipo, label_positivo, label_negativo,
         motivo_positivo, motivo_negativo, motivo_dispara_codsuceso
       )
       VALUES (
         :coddisciplina, :descripcion, :puntos, 'A', :lleva_resultado, :lleva_jugador, :es_cambio, :expulsa,
-        :dispara_codsuceso, :variante_de_codsuceso, :puntos_condicionados, :label_positivo, :label_negativo,
+        :dispara_codsuceso, :variante_de_codsuceso, :puntos_condicionados, :invierte_equipo, :label_positivo, :label_negativo,
         :motivo_positivo, :motivo_negativo, :motivo_dispara_codsuceso
       )
       `,
@@ -3583,6 +3740,7 @@ app.post('/suceso_crear', verificarToken, async (req, res) => {
           dispara_codsuceso: dispara_codsuceso || null,
           variante_de_codsuceso: variante_de_codsuceso || null,
           puntos_condicionados: puntos_condicionados === 'S' ? 'S' : 'N',
+          invierte_equipo: invierte_equipo === 'S' ? 'S' : 'N',
           label_positivo: label_positivo || null,
           label_negativo: label_negativo || null,
           motivo_positivo: motivo_positivo || null,
@@ -3605,7 +3763,7 @@ app.post('/suceso_crear', verificarToken, async (req, res) => {
 app.post('/suceso_editar', verificarToken, async (req, res) => {
   const {
     codsuceso, descripcion, puntos, estado, lleva_resultado, lleva_jugador, es_cambio, expulsa,
-    dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, label_positivo, label_negativo,
+    dispara_codsuceso, variante_de_codsuceso, puntos_condicionados, invierte_equipo, label_positivo, label_negativo,
     motivo_positivo, motivo_negativo, motivo_dispara_codsuceso
   } = req.body;
 
@@ -3624,6 +3782,7 @@ app.post('/suceso_editar', verificarToken, async (req, res) => {
           es_cambio = COALESCE(:es_cambio, es_cambio),
           expulsa = COALESCE(:expulsa, expulsa),
           puntos_condicionados = COALESCE(:puntos_condicionados, puntos_condicionados),
+          invierte_equipo = COALESCE(:invierte_equipo, invierte_equipo),
           dispara_codsuceso = :dispara_codsuceso,
           variante_de_codsuceso = :variante_de_codsuceso,
           label_positivo = :label_positivo,
@@ -3644,6 +3803,7 @@ app.post('/suceso_editar', verificarToken, async (req, res) => {
           es_cambio: es_cambio ?? null,
           expulsa: expulsa ?? null,
           puntos_condicionados: puntos_condicionados ?? null,
+          invierte_equipo: invierte_equipo ?? null,
           dispara_codsuceso: dispara_codsuceso || null,
           variante_de_codsuceso: variante_de_codsuceso || null,
           label_positivo: label_positivo || null,
